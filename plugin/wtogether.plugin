@@ -36,7 +36,7 @@ __id__ = "wtogether"
 __name__ = "Wtogether"
 __description__ = "Совместный просмотр видео в своём плеере: ведущий управляет, у всех синхронно, лобби, чат и звонок"
 __author__ = "Wtogether"
-__version__ = "2.0.1"
+__version__ = "2.0.2"
 # Иконка: имя_набора_стикеров/номер. После создания своего набора через @Stickers замени на "ИмяНабора/0"
 __icon__ = "exteraPlugins/1"
 __category__ = ["media", "chats"]
@@ -231,7 +231,7 @@ def make_new_messages_observer(plugin):
                 if id == NotificationCenter.didReceiveNewMessages:
                     plugin.on_new_messages(int(args[0]), args[1])
             except Exception as e:
-                plugin.err(f"didReceiveNewMessages: {e}")
+                plugin.log_err(f"didReceiveNewMessages: {e}")
 
     return NewMessages()
 
@@ -273,8 +273,8 @@ class Player:
         self.dialog = Dialog(self.act, AR.style.Theme_Black_NoTitleBar_Fullscreen)
         self.dialog.setContentView(self.root)
         self.dialog.setCancelable(False)
-        self.dialog.setOnKeyListener(L["Keys"](lambda: self.p.safe(self.p.ask_close)))
-        self.dialog.setOnDismissListener(L["Dismissed"](lambda: self.p.safe(self.on_dismissed)))
+        self.dialog.setOnKeyListener(L["Keys"](lambda: self.p.run_safe(self.p.ask_close)))
+        self.dialog.setOnDismissListener(L["Dismissed"](lambda: self.p.run_safe(self.on_dismissed)))
         w = self.dialog.getWindow()
         w.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         w.setSoftInputMode(16)  # adjustResize
@@ -448,9 +448,9 @@ class Player:
         self.root.addView(self.bottom, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
 
         Prepared, Completed, Failed = L["Prepared"], L["Completed"], L["Failed"]
-        self.vv.setOnPreparedListener(Prepared(lambda mp: self.p.safe(lambda: self.on_prepared(mp))))
-        self.vv.setOnCompletionListener(Completed(lambda mp: self.p.safe(lambda: self.p.on_completed())))
-        self.vv.setOnErrorListener(Failed(lambda w, e: self.p.safe(lambda: self.on_error(w, e))))
+        self.vv.setOnPreparedListener(Prepared(lambda mp: self.p.run_safe(lambda: self.on_prepared(mp))))
+        self.vv.setOnCompletionListener(Completed(lambda mp: self.p.run_safe(lambda: self.p.on_completed())))
+        self.vv.setOnErrorListener(Failed(lambda w, e: self.p.run_safe(lambda: self.on_error(w, e))))
 
     def text(self, s, size=14.0, bold=False):
         t = self.TV(self.act)
@@ -480,7 +480,7 @@ class Player:
         b = self.text(label, ts, True)
         b.setGravity(self.Gravity.CENTER)
         b.setBackground(self.shape(color, 0, oval=True))
-        b.setOnClickListener(OnClickListener(lambda v: self.p.safe(fn)))
+        b.setOnClickListener(OnClickListener(lambda v: self.p.run_safe(fn)))
         return b
 
     def pill(self, label, color, fn):
@@ -489,7 +489,7 @@ class Player:
         b.setGravity(self.Gravity.CENTER)
         b.setPadding(dp(24), dp(12), dp(24), dp(13))
         b.setBackground(self.shape(color, dp(26)))
-        b.setOnClickListener(OnClickListener(lambda v: self.p.safe(fn)))
+        b.setOnClickListener(OnClickListener(lambda v: self.p.run_safe(fn)))
         return b
 
     def head(self, user, name, dot, crown):
@@ -505,7 +505,7 @@ class Player:
                 pic.setRoundRadius(dp(15))
                 pic.setForUserOrChat(user, AvatarDrawable(user))
         except Exception as e:
-            self.p.err(f"аватарка: {e}")
+            self.p.log_err(f"аватарка: {e}")
             pic = None
         if pic is None:
             pic = self.text((name or "?")[:1].upper(), 14.0, True)
@@ -562,7 +562,7 @@ class Player:
         self.p.on_player_ready()
 
     def on_error(self, what, extra):
-        self.p.err(f"плеер: ошибка {what}/{extra}")
+        self.p.log_err(f"плеер: ошибка {what}/{extra}")
         self.big.setText("⚠️")
         self.info.setText("Это видео не открывается на устройстве")
 
@@ -611,7 +611,7 @@ class Player:
             self.mp.setPlaybackParams(params)
             self.speed = x
         except Exception as e:
-            self.p.err(f"скорость: {e}")
+            self.p.log_err(f"скорость: {e}")
 
     # ---------- ползунок ----------
 
@@ -643,7 +643,7 @@ class Player:
                 self.btn_play.setText("⏸" if self.playing() else "▶")
             self.refresh_faces()
         except Exception as e:
-            self.p.err(f"tick: {e}")
+            self.p.log_err(f"tick: {e}")
         run_on_ui_thread(self.tick, TICK_MS)
 
     def refresh_faces(self):
@@ -694,7 +694,7 @@ class Player:
             cur = self.act.getRequestedOrientation()
             self.act.setRequestedOrientation(-1 if cur == 6 else 6)  # SENSOR_LANDSCAPE ↔ как было
         except Exception as e:
-            self.p.err(f"поворот: {e}")
+            self.p.log_err(f"поворот: {e}")
 
     # ---------- сообщения ----------
 
@@ -702,7 +702,7 @@ class Player:
         t = str(self.input.getText()).strip()
         if t:
             self.input.setText("")
-            self.p.say(t)
+            self.p.say_all(t)
 
     def bubble(self, who, text, mine=False):
         if not self.alive:
@@ -785,7 +785,7 @@ class WtogetherPlugin(BasePlugin):
             get_notification_center().addObserver(self.nc_delegate, NotificationCenter.didReceiveNewMessages)
         except Exception as e:
             self.nc_delegate = None
-            self.err(f"NotificationCenter: {e}")
+            self.log_err(f"NotificationCenter: {e}")
 
         self.add_menu_item(MenuItemData(menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
                                         text="🎬 Смотреть вместе", on_click=self.on_watch_click))
@@ -806,16 +806,16 @@ class WtogetherPlugin(BasePlugin):
 
     # ---------- общее ----------
 
-    def err(self, text):
+    def log_err(self, text):
         self.logger.error(str(text))
         self.errors.append(time.strftime("%H:%M:%S ") + str(text))
         self.errors = self.errors[-20:]
 
-    def safe(self, fn):
+    def run_safe(self, fn):
         try:
             fn()
         except Exception as e:
-            self.err(f"действие: {e}")
+            self.log_err(f"действие: {e}")
             BulletinHelper.show_error("Ошибка — подробности в «Проверка работы»")
 
     def is_host(self):
@@ -824,7 +824,7 @@ class WtogetherPlugin(BasePlugin):
     def is_guest(self):
         return bool(self.session) and self.session["role"] == "guest"
 
-    def peers(self):
+    def peer_dids(self):
         if self.is_host():
             return list(self.session["guests"].keys())
         if self.is_guest():
@@ -840,7 +840,7 @@ class WtogetherPlugin(BasePlugin):
         frag = get_last_fragment()
         return frag.getParentActivity() if frag else None
 
-    def notify(self, text):
+    def notify_user(self, text):
         if self.player is not None and self.player.alive:
             self.player.bubble("Wtogether", text)
         elif self.get_setting("notify", True):
@@ -866,18 +866,18 @@ class WtogetherPlugin(BasePlugin):
         u = self.me_user()
         return u.first_name if u is not None and u.first_name else "Я"
 
-    def user(self, did):
+    def tg_user(self, did):
         try:
             return get_messages_controller().getUser(Long(did))
         except Exception:
             return None
 
-    def name(self, did):
-        u = self.user(did)
+    def user_name(self, did):
+        u = self.tg_user(did)
         return u.first_name if u is not None and u.first_name else "друг"
 
     def host_name(self):
-        return self.name(self.session["host"]) if self.is_guest() else self.my_name()
+        return self.user_name(self.session["host"]) if self.is_guest() else self.my_name()
 
     STAGE_DOT = {"ready": ONLINE, "watching": ONLINE, "loading": WAITING, "joined": WAITING,
                  "invited": OFFLINE}
@@ -888,15 +888,15 @@ class WtogetherPlugin(BasePlugin):
         if self.is_host():
             out = [(self.me_user(), self.my_name(), ONLINE, True)]
             for did, g in self.session["guests"].items():
-                out.append((self.user(did), self.name(did), self.STAGE_DOT.get(g["stage"], OFFLINE), False))
+                out.append((self.tg_user(did), self.user_name(did), self.STAGE_DOT.get(g["stage"], OFFLINE), False))
             return out
-        out = [(self.user(self.session["host"]), self.host_name(),
+        out = [(self.tg_user(self.session["host"]), self.host_name(),
                 ONLINE if now_ms() - self.last_host_msg < 30000 else OFFLINE, True)]
         me = self.my_uid()
         for r in self.session.get("roster") or []:
             uid = int(r.get("u") or 0)
             if uid and uid != me:
-                out.append((self.user(uid), r.get("n") or "?", self.STAGE_DOT.get(r.get("s"), OFFLINE), False))
+                out.append((self.tg_user(uid), r.get("n") or "?", self.STAGE_DOT.get(r.get("s"), OFFLINE), False))
         out.append((self.me_user(), self.my_name(), ONLINE, False))
         return out
 
@@ -922,14 +922,14 @@ class WtogetherPlugin(BasePlugin):
             if f is not None and f.exists() and f.length() > 0:
                 return str(f.getAbsolutePath())
         except Exception as e:
-            self.err(f"путь к файлу: {e}")
+            self.log_err(f"путь к файлу: {e}")
         return None
 
     def download(self, mo):
         try:
             get_file_loader().loadFile(mo.getDocument(), mo, 3, 0)
         except Exception as e:
-            self.err(f"загрузка: {e}")
+            self.log_err(f"загрузка: {e}")
 
     def download_percent(self, mo):
         try:
@@ -947,12 +947,12 @@ class WtogetherPlugin(BasePlugin):
     def report_progress(self, pc):
         if self.is_guest() and pc // 20 != self.last_prog // 20:
             self.last_prog = pc
-            self.send({"t": "prog", "pc": pc})
+            self.send_cmd({"t": "prog", "pc": pc})
 
     # ---------- начало ----------
 
     def on_watch_click(self, context):
-        self.safe(lambda: self.watch_message(context.get("message")))
+        self.run_safe(lambda: self.watch_message(context.get("message")))
 
     def watch_message(self, mo):
         if mo is None or not mo.isVideo():
@@ -964,15 +964,15 @@ class WtogetherPlugin(BasePlugin):
             return
         doc = self.doc_of(mo)
         if (did, doc) in self.invites and not self.is_host():
-            self.join(did, doc, mo)  # видео из приглашения — входим зрителем
+            self.join_lobby(did, doc, mo)  # видео из приглашения — входим зрителем
             return
         if self.is_guest():
             self.confirm("Ты сейчас зритель", f"Выйти из просмотра у {self.host_name()} и начать свой?",
-                         "Начать свой", lambda: (self.end(), self.watch_message(mo)))
+                         "Начать свой", lambda: (self.end_session(), self.watch_message(mo)))
             return
         if self.is_host() and self.session["doc"] != doc:
             self.confirm("Идёт другой просмотр", "Закончить текущий и начать с этим видео?",
-                         "Начать", lambda: (self.end(), self.watch_message(mo)))
+                         "Начать", lambda: (self.end_session(), self.watch_message(mo)))
             return
         if not self.session:
             self.session = {"role": "host", "doc": doc, "mo": mo, "guests": {}, "started": False}
@@ -991,7 +991,7 @@ class WtogetherPlugin(BasePlugin):
                 send_text(did, text, replyToMsg=mo)
             except Exception:
                 send_text(did, text)
-            BulletinHelper.show_success(f"👑 Приглашение отправлено {self.name(did)}")
+            BulletinHelper.show_success(f"👑 Приглашение отправлено {self.user_name(did)}")
         self.open_player(mo)
 
     def open_player(self, mo):
@@ -1002,12 +1002,12 @@ class WtogetherPlugin(BasePlugin):
             self.update_ui()
         except Exception as e:
             self.player = None
-            self.err(f"открыть плеер: {e}")
+            self.log_err(f"открыть плеер: {e}")
             BulletinHelper.show_error("Не удалось открыть плеер — см. «Проверка работы»")
 
-    def join(self, host, doc, mo):
+    def join_lobby(self, host, doc, mo):
         if self.session and not (self.is_guest() and self.session["host"] == host):
-            self.end()
+            self.end_session()
         self.session = {"role": "guest", "doc": doc, "mo": mo, "host": host, "stage": "joined", "roster": []}
         self.remote = None
         self.go = None
@@ -1018,9 +1018,9 @@ class WtogetherPlugin(BasePlugin):
         self.nudging = False
         self.last_ping = time.time()
         self.last_prog = -1
-        self.send({"t": "join"})
+        self.send_cmd({"t": "join"})
         for i in range(3):
-            threading.Timer(0.3 + i * 1.2, lambda: self.send({"t": "ping", "a": now_ms()})).start()
+            threading.Timer(0.3 + i * 1.2, lambda: self.send_cmd({"t": "ping", "a": now_ms()})).start()
         run_on_ui_thread(lambda: self.open_player(mo))
 
     def join_from_invite(self, host, doc, reply_id):
@@ -1040,13 +1040,13 @@ class WtogetherPlugin(BasePlugin):
                         raise RuntimeError(getattr(error, "text", "нет сообщения"))
                     from org.telegram.messenger import UserConfig
                     mo = MessageObject(UserConfig.selectedAccount, resp.messages.get(0), False, False)
-                    run_on_ui_thread(lambda: self.safe(lambda: self.join(host, doc, mo)))
+                    run_on_ui_thread(lambda: self.run_safe(lambda: self.join_lobby(host, doc, mo)))
                 except Exception as e:
-                    self.err(f"видео из приглашения: {e}")
+                    self.log_err(f"видео из приглашения: {e}")
                     BulletinHelper.show_info("Долгое нажатие на видео над приглашением → Плагины → «Смотреть вместе»")
             send_request(req, done)
         except Exception as e:
-            self.err(f"getMessages: {e}")
+            self.log_err(f"getMessages: {e}")
 
     # ---------- ведущий ----------
 
@@ -1056,7 +1056,7 @@ class WtogetherPlugin(BasePlugin):
         pos = self.player.position()
         at = now_ms() + COUNTDOWN_MS
         self.session["started"] = True
-        self.send({"t": "go", "pos": pos, "at": at, "r": self.player.speed or 1.0})
+        self.send_cmd({"t": "go", "pos": pos, "at": at, "r": self.player.speed or 1.0})
         self.player.countdown_at = at
         self.update_ui()
 
@@ -1066,7 +1066,7 @@ class WtogetherPlugin(BasePlugin):
 
     def broadcast_state(self, to=None):
         if self.is_host() and self.player is not None and self.player.prepared:
-            self.send(self.host_state(), to=to)
+            self.send_cmd(self.host_state(), to=to)
             self.last_beat = time.time()
 
     def host_toggle(self):
@@ -1111,20 +1111,20 @@ class WtogetherPlugin(BasePlugin):
     def on_completed(self):
         if self.is_host():
             self.broadcast_state()
-            self.notify("Видео закончилось")
+            self.notify_user("Видео закончилось")
 
     def send_roster(self):
         if not self.is_host():
             return
-        m = [{"u": d, "n": self.name(d), "s": g["stage"]} for d, g in self.session["guests"].items()
+        m = [{"u": d, "n": self.user_name(d), "s": g["stage"]} for d, g in self.session["guests"].items()
              if g["stage"] != "invited"]
-        self.send({"t": "roster", "m": m})
+        self.send_cmd({"t": "roster", "m": m})
 
     # ---------- зритель ----------
 
     def catch_up(self):
         if self.is_guest():
-            self.send({"t": "ask"})
+            self.send_cmd({"t": "ask"})
             if self.player is not None:
                 self.player.seek_block_until = 0
             BulletinHelper.show_info("Догоняю ведущего…")
@@ -1132,7 +1132,7 @@ class WtogetherPlugin(BasePlugin):
     def on_player_ready(self):
         if self.is_guest():
             self.session["stage"] = "ready"
-            self.send({"t": "ready"})
+            self.send_cmd({"t": "ready"})
         self.update_ui()
 
     # ---------- цикл плеера ----------
@@ -1177,7 +1177,7 @@ class WtogetherPlugin(BasePlugin):
             return
         if time.time() - self.last_ping > PING_EVERY:
             self.last_ping = time.time()
-            self.send({"t": "ping", "a": now_ms()})
+            self.send_cmd({"t": "ping", "a": now_ms()})
         play, seek, speed, self.nudging = plan_correction(st, self.room_now(), pl.position(),
                                                           pl.playing(), self.nudging)
         if seek is not None and time.time() > pl.seek_block_until:
@@ -1215,7 +1215,7 @@ class WtogetherPlugin(BasePlugin):
                     st = {"invited": "не ответил(а)", "joined": "подключается", "ready": "готов(а)",
                           "watching": "готов(а)",
                           "loading": f"загружает {g.get('pc', 0)}%"}.get(g["stage"], g["stage"])
-                    lines.append(f"{self.name(did)} — {st}")
+                    lines.append(f"{self.user_name(did)} — {st}")
                 pl.set_state("👥", "\n".join(lines) or "Ждём зрителей…", True)
             elif not pl.countdown_at:
                 pl.set_state("", "", False)
@@ -1230,47 +1230,47 @@ class WtogetherPlugin(BasePlugin):
 
     # ---------- общение ----------
 
-    def say(self, text):
+    def say_all(self, text):
         text = text[:300]
         at = self.player.position() if self.player is not None else 0
         self.talk.append((at, self.my_name(), text))
-        self.send({"t": "msg", "x": text, "at": at, "n": self.my_name(), "u": self.my_uid()})
+        self.send_cmd({"t": "msg", "x": text, "at": at, "n": self.my_name(), "u": self.my_uid()})
         if self.player is not None:
             self.player.bubble("Я", text, mine=True)
 
     def start_call(self):
-        dids = self.peers()
+        dids = self.peer_dids()
         if not dids:
             return
         if len(dids) == 1:
-            self.call(dids[0])
+            self.call_user(dids[0])
             return
         act = self.activity()
         b = AlertDialogBuilder(act)
         b.set_title("📞 Кому позвонить?")
-        b.set_items([self.name(d) for d in dids], lambda bb, i: (bb.dismiss(), self.call(dids[int(i)])))
+        b.set_items([self.user_name(d) for d in dids], lambda bb, i: (bb.dismiss(), self.call_user(dids[int(i)])))
         b.set_negative_button("Отмена", lambda bb, w: bb.dismiss())
         b.show()
 
-    def call(self, did):
+    def call_user(self, did):
         try:
             from org.telegram.ui.Components.voip import VoIPHelper
             from org.telegram.messenger import AccountInstance, UserConfig
             mc = get_messages_controller()
-            full = mc.getUserFull(Long(did))
+            full = mc.getUserFull(int(did))
             VoIPHelper.startCall(mc.getUser(Long(did)), False,
                                  bool(full is not None and full.video_calls_available),
                                  self.activity(), full, AccountInstance.getInstance(UserConfig.selectedAccount))
         except Exception as e:
-            self.err(f"звонок: {e}")
+            self.log_err(f"звонок: {e}")
             BulletinHelper.show_error("Не удалось начать звонок")
 
     def send_talk(self):
-        if not self.talk or not self.peers():
+        if not self.talk or not self.peer_dids():
             return
         lines = [f"{fmt_time(at)} {who}: {t}" for at, who, t in sorted(self.talk, key=lambda x: x[0])]
         body = "🎬 Обсуждали видео вместе:\n\n" + "\n".join(lines)
-        for did in self.peers():
+        for did in self.peer_dids():
             send_text(did, body[:4000])
         self.talk = []
 
@@ -1284,7 +1284,7 @@ class WtogetherPlugin(BasePlugin):
             b = AlertDialogBuilder(act)
             b.set_title(title)
             b.set_message(message)
-            b.set_positive_button(yes, lambda bb, w: (bb.dismiss(), self.safe(fn)))
+            b.set_positive_button(yes, lambda bb, w: (bb.dismiss(), self.run_safe(fn)))
             b.set_negative_button("Отмена", lambda bb, w: bb.dismiss())
             b.show()
         run_on_ui_thread(ui)
@@ -1295,18 +1295,18 @@ class WtogetherPlugin(BasePlugin):
                 self.player.close()
             return
         if self.is_host():
-            self.confirm("Закончить просмотр?", "Плеер закроется у всех зрителей.", "Закончить", self.end)
+            self.confirm("Закончить просмотр?", "Плеер закроется у всех зрителей.", "Закончить", self.end_session)
         else:
             self.confirm("Выйти из просмотра?", f"{self.host_name()} и остальные продолжат без тебя.",
-                         "Выйти", self.end)
+                         "Выйти", self.end_session)
 
-    def end(self):
+    def end_session(self):
         if self.is_host():
             if self.talk and self.get_setting("send_talk", True):
                 self.send_talk()
-            self.send({"t": "stop"})
+            self.send_cmd({"t": "stop"})
         elif self.is_guest():
-            self.send({"t": "leave"})
+            self.send_cmd({"t": "leave"})
         self.session = None
         self.remote = None
         self.go = None
@@ -1319,7 +1319,7 @@ class WtogetherPlugin(BasePlugin):
             return            # старый плеер, уже отвязан
         self.player = None
         if self.session:      # закрыли не через «Закончить» — считаем, что вышли
-            self.end()
+            self.end_session()
 
     # ---------- панель и настройки ----------
 
@@ -1329,7 +1329,7 @@ class WtogetherPlugin(BasePlugin):
         if self.is_host():
             lines = ["👑 Ты ведёшь просмотр", ""]
             for did, g in self.session["guests"].items():
-                lines.append(f"{self.name(did)}: {g['stage']}" + (f" {g['pc']}%" if g["stage"] == "loading" else ""))
+                lines.append(f"{self.user_name(did)}: {g['stage']}" + (f" {g['pc']}%" if g["stage"] == "loading" else ""))
             return "\n".join(lines)
         return f"👑 Ведёт {self.host_name()}\nУправлять видео может только ведущий."
 
@@ -1346,7 +1346,7 @@ class WtogetherPlugin(BasePlugin):
                                       lambda bb, w: (bb.dismiss(), self.open_player(self.session["mo"])))
             if self.session:
                 b.set_negative_button("Закончить" if self.is_host() else "Выйти",
-                                      lambda bb, w: (bb.dismiss(), self.safe(self.end)))
+                                      lambda bb, w: (bb.dismiss(), self.run_safe(self.end_session)))
             b.set_neutral_button("Закрыть", lambda bb, w: bb.dismiss())
             b.show()
         run_on_ui_thread(ui)
@@ -1420,8 +1420,8 @@ class WtogetherPlugin(BasePlugin):
                 "ping": "связь", "pong": "связь", "roster": "участники", "ask": "синхронизация",
                 "leave": "вышел(ла)", "stop": "просмотр закончен", "decline": "отказ"}.get(t, t or "")
 
-    def send(self, cmd, to=None):
-        targets = [to] if to else self.peers()
+    def send_cmd(self, cmd, to=None):
+        targets = [to] if to else self.peer_dids()
         doc = cmd.get("d") or (self.session["doc"] if self.session else 0)
         for did in targets:
             c = dict(cmd)
@@ -1430,7 +1430,7 @@ class WtogetherPlugin(BasePlugin):
                     json.dumps(c, separators=(",", ":"), ensure_ascii=False))
             try:
                 req = TLRPC.TL_messages_sendMessage()
-                req.peer = get_messages_controller().getInputPeer(Long(did))
+                req.peer = get_messages_controller().getInputPeer(int(did))
                 req.message = text
                 req.random_id = random.getrandbits(62)
                 req.no_webpage = True
@@ -1439,12 +1439,12 @@ class WtogetherPlugin(BasePlugin):
                 self.stats["sent"] += 1
             except Exception as e:
                 self.stats["send_err"] += 1
-                self.err(f"отправка: {e}")
+                self.log_err(f"отправка: {e}")
 
     def after_sent(self, resp, error):
         if error is not None or resp is None:
             self.stats["send_err"] += 1
-            self.err(f"команда не ушла: {getattr(error, 'text', error)}")
+            self.log_err(f"команда не ушла: {getattr(error, 'text', error)}")
             return
         try:
             if hasattr(resp, "updates") and resp.updates is not None:
@@ -1455,7 +1455,7 @@ class WtogetherPlugin(BasePlugin):
             elif hasattr(resp, "id"):
                 self.to_delete.append(int(resp.id))
         except Exception as e:
-            self.err(f"after_sent: {e}")
+            self.log_err(f"after_sent: {e}")
 
     def flush_deletes(self):
         if not self.running:
@@ -1467,9 +1467,9 @@ class WtogetherPlugin(BasePlugin):
                 req.revoke = True
                 for i in ids:
                     req.id.add(Integer(i))
-                send_request(req, lambda r, e: e is not None and self.err(f"удаление: {getattr(e, 'text', e)}"))
+                send_request(req, lambda r, e: e is not None and self.log_err(f"удаление: {getattr(e, 'text', e)}"))
             except Exception as e:
-                self.err(f"удаление: {e}")
+                self.log_err(f"удаление: {e}")
         threading.Timer(DELETE_EVERY, self.flush_deletes).start()
 
     def delete_local(self, did, mids):
@@ -1507,7 +1507,7 @@ class WtogetherPlugin(BasePlugin):
                 m.invoke(mc, *args)
                 return
         except Exception as e:
-            self.err(f"удаление у себя: {e}")
+            self.log_err(f"удаление у себя: {e}")
 
     # ---------- приём ----------
 
@@ -1524,7 +1524,7 @@ class WtogetherPlugin(BasePlugin):
             if self.incoming(int(MessageObject.getDialogId(msg)), int(msg.id), msg.message, reply):
                 return HookResult(strategy=HookStrategy.CANCEL)
         except Exception as e:
-            self.err(f"on_update_hook: {e}")
+            self.log_err(f"on_update_hook: {e}")
         return HookResult()
 
     def on_updates_hook(self, container_name, account, updates):
@@ -1539,7 +1539,7 @@ class WtogetherPlugin(BasePlugin):
             if self.incoming(int(updates.user_id), int(updates.id), updates.message, reply):
                 return HookResult(strategy=HookStrategy.CANCEL)
         except Exception as e:
-            self.err(f"on_updates_hook: {e}")
+            self.log_err(f"on_updates_hook: {e}")
         return HookResult()
 
     def on_new_messages(self, did, messages):
@@ -1560,7 +1560,7 @@ class WtogetherPlugin(BasePlugin):
                 if self.incoming(did, int(mo.getId()), text, reply):
                     hide.append(int(mo.getId()))
             except Exception as e:
-                self.err(f"new message: {e}")
+                self.log_err(f"new message: {e}")
         if hide:
             run_on_ui_thread(lambda: self.delete_local(did, hide))
 
@@ -1578,13 +1578,13 @@ class WtogetherPlugin(BasePlugin):
             self.seen.clear()
         self.stats["recv"] += 1
         self.stats["last_recv"] = now_ms()
-        run_on_ui_thread(lambda: self.safe(lambda: self.process(did, cmd, reply)))
+        run_on_ui_thread(lambda: self.run_safe(lambda: self.process(did, cmd, reply)))
         return hide
 
     def process(self, did, c, reply):
         t = c.get("t")
         doc = int(c.get("d") or 0)
-        name = self.name(did)
+        name = self.user_name(did)
 
         if t == "invite":
             self.invites[(did, doc)] = reply
@@ -1597,24 +1597,24 @@ class WtogetherPlugin(BasePlugin):
             g["seen"] = now_ms()
             if t == "join":
                 g["stage"] = "joined"
-                self.notify(f"✅ {name} подключается")
+                self.notify_user(f"✅ {name} подключается")
                 self.send_roster()
             elif t == "prog":
                 g["stage"] = "loading"
                 g["pc"] = int(c.get("pc") or 0)
             elif t == "ready":
                 g["stage"] = "ready"
-                self.notify(f"🟢 {name} готов(а)")
+                self.notify_user(f"🟢 {name} готов(а)")
                 self.send_roster()
                 if self.session["started"]:
                     self.broadcast_state(to=did)
             elif t == "ask":
                 self.broadcast_state(to=did)
             elif t == "ping":
-                self.send({"t": "pong", "a": c.get("a"), "b": now_ms()}, to=did)
+                self.send_cmd({"t": "pong", "a": c.get("a"), "b": now_ms()}, to=did)
             elif t in ("leave", "decline"):
                 self.session["guests"].pop(did, None)
-                self.notify(f"👋 {name} " + ("вышел(ла)" if t == "leave" else "отказался(ась)"))
+                self.notify_user(f"👋 {name} " + ("вышел(ла)" if t == "leave" else "отказался(ась)"))
                 self.send_roster()
             elif t == "msg":
                 x = str(c.get("x") or "")[:300]
@@ -1622,9 +1622,9 @@ class WtogetherPlugin(BasePlugin):
                 self.talk.append((at, name, x))
                 if self.player is not None:
                     self.player.bubble(name, x)
-                for other in self.peers():
+                for other in self.peer_dids():
                     if other != did:
-                        self.send({"t": "msg", "x": x, "at": at, "n": name, "u": did}, to=other)
+                        self.send_cmd({"t": "msg", "x": x, "at": at, "n": name, "u": did}, to=other)
             self.update_ui()
             return
 
@@ -1657,9 +1657,9 @@ class WtogetherPlugin(BasePlugin):
                 if self.player is not None:
                     self.player.bubble(who, x)
                 else:
-                    self.notify(f"💬 {who}: {x}")
+                    self.notify_user(f"💬 {who}: {x}")
             elif t == "stop":
-                self.notify(f"⏹ {name} закончил(а) просмотр")
+                self.notify_user(f"⏹ {name} закончил(а) просмотр")
                 self.session = None
                 self.remote = None
                 if self.player is not None:
@@ -1668,13 +1668,13 @@ class WtogetherPlugin(BasePlugin):
             self.update_ui()
 
     def on_invite(self, host, doc, reply):
-        name = self.name(host)
+        name = self.user_name(host)
 
         def accept():
             self.join_from_invite(host, doc, reply)
 
         def decline():
-            self.send({"t": "decline", "d": doc}, to=host)
+            self.send_cmd({"t": "decline", "d": doc}, to=host)
 
         if not self.get_setting("ask_invite", True) and not self.session:
             accept()
@@ -1687,8 +1687,8 @@ class WtogetherPlugin(BasePlugin):
         b.set_title(f"🎬 {name} зовёт смотреть вместе")
         b.set_message(f"{name} — ведущий 👑: он ставит паузу и перематывает, у тебя всё повторяется само.\n\n"
                       "Откроется общий плеер, видео загрузится, и вы начнёте одновременно.")
-        b.set_positive_button("Смотреть", lambda bb, w: (bb.dismiss(), self.safe(accept)))
-        b.set_negative_button("Отказаться", lambda bb, w: (bb.dismiss(), self.safe(decline)))
+        b.set_positive_button("Смотреть", lambda bb, w: (bb.dismiss(), self.run_safe(accept)))
+        b.set_negative_button("Отказаться", lambda bb, w: (bb.dismiss(), self.run_safe(decline)))
         b.set_neutral_button("Позже", lambda bb, w: bb.dismiss())
         b.show()
         try:

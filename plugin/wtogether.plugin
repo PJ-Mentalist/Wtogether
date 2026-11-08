@@ -1,11 +1,13 @@
 """
 Wtogether для exteraGram: совместный просмотр видео из личного чата.
 
-Как работает:
-1. Долгое нажатие на видео в личке → Плагины → «Смотреть вместе». Другу уходит приглашение.
-2. У друга появляется окно «Принять / Отказаться».
-3. Оба открываете это видео. Пауза, перемотка и скорость становятся общими.
-4. Меню чата (⋮) → «Wtogether» — панель: статус, синхронизация, завершение.
+1. Долгое нажатие на видео в личке → Плагины → «🎬 Смотреть вместе». Другу уходит приглашение.
+2. У друга появляется окно «Смотреть / Отказаться / Позже».
+3. Оба открываете видео. Поверх плеера появляются аватарки участников и кнопки:
+   −10 с, ▶/⏸, +10 с, 💬 сообщение, 📞 голосовой звонок.
+4. Пауза, перемотка и скорость общие. Сообщения всплывают поверх видео у обоих,
+   а после просмотра уходят в чат одним сообщением «обсуждение».
+5. Меню чата (⋮) → «🎬 Wtogether» — панель: статус, синхронизация, завершение.
 Служебные команды идут тихими сообщениями: у друга скрываются, у отправителя удаляются.
 Плагин должен стоять у обоих.
 """
@@ -18,7 +20,7 @@ import time
 from base_plugin import BasePlugin, HookResult, HookStrategy, MenuItemData, MenuItemType, MethodHook
 from hook_utils import find_class, get_private_field
 from client_utils import send_request, send_text, get_messages_controller, get_last_fragment
-from android_utils import run_on_ui_thread
+from android_utils import run_on_ui_thread, OnClickListener
 from ui.bulletin import BulletinHelper
 from ui.alert import AlertDialogBuilder
 from ui.settings import Header, Switch, Text, Divider
@@ -28,21 +30,29 @@ from org.telegram.messenger import MessageObject
 
 __id__ = "wtogether"
 __name__ = "Wtogether"
-__description__ = "Смотрите видео из личного чата вместе: пауза, перемотка и скорость общие у обоих"
+__description__ = "Смотрите видео из личного чата вместе: общие пауза и перемотка, кнопки поверх видео, сообщения и голос"
 __author__ = "Wtogether"
-__version__ = "1.1.0"
+__version__ = "1.2.0"
+# Иконка: имя_набора_стикеров/номер. После создания своего набора через @Stickers замени на "ИмяНабора/0"
 __icon__ = "exteraPlugins/1"
 __category__ = ["media", "chats"]
 
 TAG = "#wt1 "
 TAG_RE = re.compile(r"#wt1 (\{.*\})", re.S)
-# невидимая метка: команда кодируется символами нулевой ширины, текст остаётся чистым
 ZW0, ZW1, ZWM = "​", "‌", "⁣"
 
 SEND_DELAY = 0.45      # с: склеиваем частые события (перетаскивание ползунка) в одну команду
 QUIET = 1.5            # с: после применения команды друга не отправляем «эхо»
 DRIFT_MS = 700         # расхождение, после которого перематываем
 DELETE_AFTER = 3.0     # с: через сколько удалять свою служебную команду с сервера
+SKIP_MS = 10000        # шаг кнопок −10 / +10
+BUBBLE_MS = 7000       # сколько висит сообщение поверх видео
+
+ACCENT = "#3E8EF7"     # синий exteraGram
+DARK = "#99000000"
+DARKER = "#B3000000"
+ONLINE = "#4CD964"
+OFFLINE = "#8E8E93"
 
 
 def now_ms():
@@ -107,6 +117,225 @@ class PlayerHook(MethodHook):
             self.plugin.logger.error(f"player hook {self.name}: {e}")
 
 
+class ViewerHook(MethodHook):
+    """Закрытие просмотрщика и показ/скрытие его панелей."""
+    def __init__(self, plugin, name):
+        self.plugin = plugin
+        self.name = name
+
+    def after_hooked_method(self, param):
+        try:
+            if self.name == "closePhoto":
+                self.plugin.on_viewer_closed()
+            elif self.name == "toggleActionBar" and param.args and len(param.args) > 0:
+                self.plugin.set_controls_visible(bool(param.args[0]))
+        except Exception as e:
+            self.plugin.logger.error(f"viewer hook {self.name}: {e}")
+
+
+class Overlay:
+    """Интерфейс поверх плеера: аватарки, кнопки, всплывающие сообщения."""
+
+    def __init__(self, plugin, pv):
+        from android.widget import FrameLayout, LinearLayout, TextView
+        from android.view import Gravity
+        from android.graphics import Color, Typeface
+        from android.graphics.drawable import GradientDrawable
+        from org.telegram.messenger import AndroidUtilities
+
+        self.p = plugin
+        self.pv = pv
+        self.FrameLayout, self.LinearLayout, self.TextView = FrameLayout, LinearLayout, TextView
+        self.Gravity, self.Color, self.Typeface, self.GradientDrawable = Gravity, Color, Typeface, GradientDrawable
+        self.dp = lambda v: AndroidUtilities.dp(float(v))
+        self.alive = True
+        self.bubbles = []
+
+        self.container = get_private_field(pv, "containerView")
+        ctx = self.container.getContext()
+        self.ctx = ctx
+        dp = self.dp
+        LP = FrameLayout.LayoutParams
+
+        self.root = FrameLayout(ctx)
+
+        # --- головы участников (вверху справа) ---
+        self.heads = LinearLayout(ctx)
+        self.heads.setOrientation(LinearLayout.HORIZONTAL)
+        self.heads.setGravity(Gravity.CENTER_VERTICAL)
+        self.heads.setPadding(dp(5), dp(5), dp(12), dp(5))
+        self.heads.setBackground(self.round(DARK, dp(22)))
+        me = plugin.me_user()
+        friend = plugin.friend_user()
+        self.heads.addView(self.head(me, plugin.my_name(), True), LinearLayout.LayoutParams(dp(34), dp(34)))
+        lp = LinearLayout.LayoutParams(dp(34), dp(34))
+        lp.leftMargin = -dp(9)
+        self.friend_head = self.head(friend, plugin.friend_name(plugin.session["dialog"]), False)
+        self.heads.addView(self.friend_head, lp)
+        self.status = TextView(ctx)
+        self.status.setTextColor(Color.WHITE)
+        self.status.setTextSize(13.0)
+        self.status.setTypeface(Typeface.DEFAULT_BOLD)
+        self.status.setSingleLine(True)
+        slp = LinearLayout.LayoutParams(-2, -2)
+        slp.leftMargin = dp(8)
+        self.heads.addView(self.status, slp)
+        self.heads.setOnClickListener(OnClickListener(lambda v: plugin.open_panel()))
+        hlp = LP(-2, -2, Gravity.TOP | Gravity.END)
+        hlp.topMargin = dp(92)
+        hlp.rightMargin = dp(12)
+        self.root.addView(self.heads, hlp)
+
+        # --- всплывающие сообщения (слева снизу) ---
+        self.feed = LinearLayout(ctx)
+        self.feed.setOrientation(LinearLayout.VERTICAL)
+        flp = LP(dp(270), -2, Gravity.BOTTOM | Gravity.START)
+        flp.leftMargin = dp(12)
+        flp.bottomMargin = dp(186)
+        self.root.addView(self.feed, flp)
+
+        # --- кнопки управления (снизу по центру, над ползунком) ---
+        self.controls = LinearLayout(ctx)
+        self.controls.setOrientation(LinearLayout.HORIZONTAL)
+        self.controls.setGravity(Gravity.CENTER)
+        self.btn_back = self.button("−10", 48, DARK, lambda v: plugin.skip(-SKIP_MS))
+        self.btn_play = self.button("▶", 62, ACCENT, lambda v: plugin.play_pause(), 24.0)
+        self.btn_fwd = self.button("+10", 48, DARK, lambda v: plugin.skip(SKIP_MS))
+        self.btn_chat = self.button("💬", 48, DARK, lambda v: plugin.compose_message(), 20.0)
+        self.btn_voice = self.button("📞", 48, DARK, lambda v: plugin.start_call(), 20.0)
+        for b, size in ((self.btn_back, 48), (self.btn_play, 62), (self.btn_fwd, 48),
+                        (self.btn_chat, 48), (self.btn_voice, 48)):
+            blp = LinearLayout.LayoutParams(dp(size), dp(size))
+            blp.leftMargin = dp(6)
+            blp.rightMargin = dp(6)
+            self.controls.addView(b, blp)
+        clp = LP(-2, -2, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL)
+        clp.bottomMargin = dp(104)
+        self.root.addView(self.controls, clp)
+
+        self.container.addView(self.root, LP(-1, -1))
+        self.controls.setVisibility(0 if plugin.get_setting("controls", True) else 8)
+        self.tick()
+
+    # --- построение ---
+
+    def round(self, color, radius, oval=False):
+        d = self.GradientDrawable()
+        d.setColor(self.Color.parseColor(color))
+        if oval:
+            d.setShape(self.GradientDrawable.OVAL)
+        else:
+            d.setCornerRadius(float(radius))
+        return d
+
+    def button(self, text, size, color, on_click, text_size=15.0):
+        b = self.TextView(self.ctx)
+        b.setText(text)
+        b.setTextColor(self.Color.WHITE)
+        b.setTextSize(text_size)
+        b.setTypeface(self.Typeface.DEFAULT_BOLD)
+        b.setGravity(self.Gravity.CENTER)
+        b.setBackground(self.round(color, 0, oval=True))
+        b.setOnClickListener(OnClickListener(on_click))
+        return b
+
+    def head(self, user, name, online):
+        """Аватарка с точкой статуса."""
+        dp = self.dp
+        box = self.FrameLayout(self.ctx)
+        ring = self.round("#FFFFFF", 0, oval=True)
+        box.setBackground(ring)
+        box.setPadding(dp(2), dp(2), dp(2), dp(2))
+        pic = None
+        try:
+            from org.telegram.ui.Components import BackupImageView, AvatarDrawable
+            if user is not None:
+                pic = BackupImageView(self.ctx)
+                pic.setRoundRadius(dp(15))
+                pic.setForUserOrChat(user, AvatarDrawable(user))
+        except Exception as e:
+            self.p.logger.info(f"аватарка недоступна: {e}")
+            pic = None
+        if pic is None:
+            pic = self.TextView(self.ctx)
+            pic.setText((name or "?")[:1].upper())
+            pic.setTextColor(self.Color.WHITE)
+            pic.setTypeface(self.Typeface.DEFAULT_BOLD)
+            pic.setGravity(self.Gravity.CENTER)
+            pic.setBackground(self.round(ACCENT, 0, oval=True))
+        box.addView(pic, self.FrameLayout.LayoutParams(-1, -1))
+        dot = self.TextView(self.ctx)
+        dot.setBackground(self.round(ONLINE if online else OFFLINE, 0, oval=True))
+        dlp = self.FrameLayout.LayoutParams(dp(10), dp(10), self.Gravity.BOTTOM | self.Gravity.END)
+        box.addView(dot, dlp)
+        box.setTag(dot)
+        return box
+
+    # --- обновление ---
+
+    def tick(self):
+        if not self.alive:
+            return
+        try:
+            pv, player = self.p.session_player()
+            if player is None:
+                self.p.close_overlay()
+                return
+            playing = bool(player.isPlaying())
+            self.btn_play.setText("⏸" if playing else "▶")
+            name = self.p.friend_name(self.p.session["dialog"])
+            here = self.p.session.get("friend_open")
+            self.status.setText(f"{name} · {fmt_time(player.getCurrentPosition())}" if here
+                                else f"Ждём {name}…")
+            dot = self.friend_head.getTag()
+            if dot is not None:
+                dot.setBackground(self.round(ONLINE if here else OFFLINE, 0, oval=True))
+        except Exception as e:
+            self.p.logger.error(f"overlay tick: {e}")
+        run_on_ui_thread(self.tick, 500)
+
+    def bubble(self, who, text, mine=False):
+        if not self.alive:
+            return
+        dp = self.dp
+        t = self.TextView(self.ctx)
+        t.setText(f"{who}: {text}")
+        t.setTextColor(self.Color.WHITE)
+        t.setTextSize(14.0)
+        t.setPadding(dp(12), dp(7), dp(12), dp(8))
+        t.setBackground(self.round(ACCENT if mine else DARKER, dp(16)))
+        lp = self.LinearLayout.LayoutParams(-2, -2)
+        lp.topMargin = dp(6)
+        self.feed.addView(t, lp)
+        self.bubbles.append(t)
+        while len(self.bubbles) > 4:
+            old = self.bubbles.pop(0)
+            self.feed.removeView(old)
+
+        def fade():
+            if t in self.bubbles:
+                self.bubbles.remove(t)
+                try:
+                    self.feed.removeView(t)
+                except Exception:
+                    pass
+        run_on_ui_thread(fade, BUBBLE_MS)
+
+    def set_controls_visible(self, show):
+        if self.alive and self.p.get_setting("controls", True):
+            self.controls.animate().alpha(1.0 if show else 0.0).setDuration(200).start()
+            self.controls.setClickable(show)
+
+    def remove(self):
+        self.alive = False
+        try:
+            parent = self.root.getParent()
+            if parent is not None:
+                parent.removeView(self.root)
+        except Exception:
+            pass
+
+
 class WtogetherPlugin(BasePlugin):
 
     # ---------- жизненный цикл ----------
@@ -114,9 +343,11 @@ class WtogetherPlugin(BasePlugin):
     def on_plugin_load(self):
         # session: {"dialog", "doc", "accepted", "since", "friend_open"}
         self.session = None
-        self.remote = None       # последнее состояние от друга
-        self.remote_at = 0       # когда оно пришло (мс)
-        self.bound = None        # плеер, который сейчас синхронизируем
+        self.remote = None
+        self.remote_at = 0
+        self.bound = None
+        self.overlay = None
+        self.talk = []           # обсуждение: [(позиция мс, имя, текст)]
         self.quiet_until = 0.0
         self.seq = 0
         self.seen = set()
@@ -143,7 +374,13 @@ class WtogetherPlugin(BasePlugin):
         hooked = 0
         for name in ("play", "pause", "seekTo", "setPlaybackSpeed"):
             hooked += len(self.hook_all_methods(player_cls, name, PlayerHook(self, name)) or [])
-        self.logger.info(f"Wtogether загружен, хуков плеера: {hooked}")
+        if self.pv_class:
+            for name in ("closePhoto", "toggleActionBar"):
+                hooked += len(self.hook_all_methods(self.pv_class, name, ViewerHook(self, name)) or [])
+        self.logger.info(f"Wtogether загружен, хуков: {hooked}")
+
+    def on_plugin_unload(self):
+        run_on_ui_thread(self.close_overlay)
 
     # ---------- настройки и панель ----------
 
@@ -152,6 +389,9 @@ class WtogetherPlugin(BasePlugin):
         if self.session:
             items.append(Text(text=self.status_title(), subtext=self.status_line(), icon="msg_info",
                               on_click=lambda v: self.open_panel()))
+            if self.talk:
+                items.append(Text(text=f"Отправить обсуждение в чат ({len(self.talk)})", accent=True,
+                                  on_click=lambda v: self.send_talk()))
             items.append(Text(text="Закончить совместный просмотр", red=True,
                               on_click=lambda v: self.stop_session(reload=True)))
         else:
@@ -159,19 +399,26 @@ class WtogetherPlugin(BasePlugin):
                               subtext="Долгое нажатие на видео в личке → Плагины → «Смотреть вместе»"))
         items += [
             Divider(),
-            Header(text="Уведомления"),
+            Header(text="Экран просмотра"),
+            Switch(key="controls", text="Кнопки поверх видео", default=True,
+                   subtext="−10 с, ▶/⏸, +10 с, сообщение и звонок"),
             Switch(key="notify", text="Действия друга", default=True,
                    subtext="Пауза, перемотка, подключение"),
+            Divider(),
+            Header(text="Обсуждение"),
+            Switch(key="send_talk", text="Отправлять обсуждение в чат", default=True,
+                   subtext="Сообщения, написанные во время просмотра, уйдут в чат одним сообщением, "
+                           "когда ты закончишь просмотр"),
             Switch(key="ask_invite", text="Спрашивать перед подключением", default=True,
-                   subtext="Окно «Принять / Отказаться», когда друг зовёт смотреть"),
+                   subtext="Окно «Смотреть / Отказаться», когда друг зовёт"),
             Divider(),
             Header(text="Как пользоваться"),
             Text(text="1. Позови друга",
                  subtext="Долгое нажатие на видео в личке → Плагины → «Смотреть вместе»"),
             Text(text="2. Откройте видео оба",
-                 subtext="Кто откроет позже, сам догонит позицию"),
-            Text(text="3. Управляйте вместе",
-                 subtext="Пауза, перемотка и скорость общие. Меню чата ⋮ → «Wtogether» — панель"),
+                 subtext="Появятся ваши аватарки и кнопки. Кто откроет позже, догонит сам"),
+            Text(text="3. Смотрите и обсуждайте",
+                 subtext="💬 — сообщение поверх видео, 📞 — голосовой звонок. Нажми на аватарки — панель"),
             Divider(text="Плагин нужен у обоих собеседников"),
         ]
         return items
@@ -198,21 +445,36 @@ class WtogetherPlugin(BasePlugin):
             when = "только что" if ago < 5 else (f"{ago} с назад" if ago < 60 else f"{ago // 60} мин назад")
             parts.append(("у друга играет " if self.remote["p"] else "у друга пауза на ") +
                          fmt_time(self.remote["pos"]) + f" ({when})")
-        parts.append("у тебя видео открыто" if self.bound is not None and self.session_player()[1] is not None
-                     else "у тебя видео не открыто")
+        parts.append("у тебя видео открыто" if self.session_player()[1] is not None else "у тебя видео не открыто")
+        if self.talk:
+            parts.append(f"сообщений в обсуждении: {len(self.talk)}")
         return " · ".join(parts)
 
-    def dialog(self, title, message, positive=None, negative=None, neutral=None, red_negative=False):
+    def activity(self):
+        try:
+            pv, _, _ = self.viewer()
+            if pv is not None:
+                act = get_private_field(pv, "parentActivity")
+                if act is not None:
+                    return act
+        except Exception:
+            pass
+        frag = get_last_fragment()
+        return frag.getParentActivity() if frag else None
+
+    def dialog(self, title, message, positive=None, negative=None, neutral=None, red_negative=False, view=None):
         """Окно с кнопками. Каждая кнопка — (текст, функция или None)."""
         def ui():
-            frag = get_last_fragment()
-            act = frag.getParentActivity() if frag else None
+            act = self.activity()
             if act is None:
                 BulletinHelper.show_info(f"{title}. {message}")
                 return
             b = AlertDialogBuilder(act)
             b.set_title(title)
-            b.set_message(message)
+            if message:
+                b.set_message(message)
+            if view is not None:
+                b.set_view(view(act))
 
             def wrap(fn):
                 def cb(builder, which):
@@ -246,11 +508,14 @@ class WtogetherPlugin(BasePlugin):
                         "Плагин нужен у обоих.",
                         positive=("Понятно", None))
             return
+        neutral = ("Закрыть", None)
+        if self.talk:
+            neutral = (f"В чат ({len(self.talk)})", self.send_talk)
         self.dialog("🎬 " + self.status_title(),
                     self.status_line().replace(" · ", "\n"),
-                    positive=("Подтянуть друга ко мне", self.resync),
+                    positive=("Подтянуть друга", self.resync),
                     negative=("Закончить", lambda: self.stop_session()),
-                    neutral=("Закрыть", None),
+                    neutral=neutral,
                     red_negative=True)
 
     # ---------- действия ----------
@@ -279,15 +544,116 @@ class WtogetherPlugin(BasePlugin):
         BulletinHelper.show_success(f"Приглашение отправлено {self.friend_name(did)}")
 
     def resync(self):
-        if not self.session or self.bound is None or self.session_player()[1] is None:
+        if not self.session or self.session_player()[1] is None:
             BulletinHelper.show_error("Сначала открой видео")
             return
         run_on_ui_thread(lambda: self.send_state(force=True))
         BulletinHelper.show_success("Друг перемотан к твоей позиции")
 
+    def play_pause(self):
+        pv, player = self.session_player()
+        if player is None:
+            return
+        self.toggle(pv, player, not bool(player.isPlaying()))
+
+    def skip(self, delta):
+        pv, player = self.session_player()
+        if player is None:
+            return
+        try:
+            dur = int(player.getDuration())
+        except Exception:
+            dur = 0
+        pos = max(0, int(player.getCurrentPosition()) + delta)
+        if dur > 0:
+            pos = min(pos, dur - 500)
+        player.seekTo(pos)
+
+    def compose_message(self):
+        if not self.session:
+            return
+        holder = {}
+
+        def make_view(act):
+            from android.widget import EditText
+            e = EditText(act)
+            e.setHint("Что думаешь об этом моменте?")
+            e.setSingleLine(False)
+            e.setMaxLines(4)
+            try:
+                from org.telegram.ui.ActionBar import Theme
+                e.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+                e.setHintTextColor(Theme.getColor(Theme.key_dialogTextHint))
+            except Exception:
+                pass
+            try:
+                from org.telegram.messenger import AndroidUtilities
+                pad = AndroidUtilities.dp(22.0)
+                e.setPadding(pad, pad // 2, pad, pad // 2)
+            except Exception:
+                pass
+            holder["edit"] = e
+            return e
+
+        def send():
+            e = holder.get("edit")
+            text = str(e.getText()).strip() if e is not None else ""
+            if text:
+                self.say(text)
+
+        pos = self.current_pos()
+        self.dialog(f"💬 Сообщение на {fmt_time(pos)}", None,
+                    positive=("Отправить", send), negative=("Отмена", None), view=make_view)
+
+    def current_pos(self):
+        pv, player = self.session_player()
+        try:
+            return int(player.getCurrentPosition()) if player is not None else 0
+        except Exception:
+            return 0
+
+    def say(self, text):
+        text = text[:300]
+        at = self.current_pos()
+        self.talk.append((at, self.my_name(), text))
+        self.send_cmd({"t": "msg", "x": text, "at": at})
+        run_on_ui_thread(lambda: self.overlay and self.overlay.bubble("Я", text, mine=True))
+
+    def start_call(self):
+        if not self.session:
+            return
+        did = self.session["dialog"]
+        try:
+            from org.telegram.ui.Components.voip import VoIPHelper
+            from org.telegram.messenger import AccountInstance, UserConfig
+            mc = get_messages_controller()
+            user = mc.getUser(Long(did))
+            full = mc.getUserFull(Long(did))
+            can_video = bool(full is not None and full.video_calls_available)
+            VoIPHelper.startCall(user, False, can_video, self.activity(), full,
+                                 AccountInstance.getInstance(UserConfig.selectedAccount))
+            self.send_cmd({"t": "voice"})
+        except Exception as e:
+            self.logger.error(f"start_call: {e}")
+            BulletinHelper.show_error("Не удалось начать звонок. Позвони из профиля друга")
+
+    def send_talk(self):
+        if not self.session or not self.talk:
+            return
+        did = self.session["dialog"]
+        lines = [f"{fmt_time(at)} {who}: {text}" for at, who, text in sorted(self.talk, key=lambda x: x[0])]
+        body = "🎬 Обсуждали видео вместе:\n\n" + "\n".join(lines)
+        if len(body) > 4000:
+            body = body[:3990] + "…"
+        send_text(did, body)
+        self.talk = []
+        BulletinHelper.show_success("Обсуждение отправлено в чат")
+
     def stop_session(self, reload=False):
         if not self.session:
             return
+        if self.talk and self.get_setting("send_talk", True):
+            self.send_talk()
         self.send_cmd({"t": "stop"})
         self.clear_session()
         BulletinHelper.show_info("Совместный просмотр закончен")
@@ -298,11 +664,73 @@ class WtogetherPlugin(BasePlugin):
         self.session = {"dialog": did, "doc": doc, "accepted": accepted, "since": now_ms(), "friend_open": False}
         self.remote = None
         self.bound = None
+        self.talk = []
 
     def clear_session(self):
         self.session = None
         self.remote = None
         self.bound = None
+        self.talk = []
+        run_on_ui_thread(self.close_overlay)
+
+    # ---------- пользователи ----------
+
+    def me_user(self):
+        try:
+            from org.telegram.messenger import UserConfig
+            return UserConfig.getInstance(UserConfig.selectedAccount).getCurrentUser()
+        except Exception:
+            return None
+
+    def my_name(self):
+        u = self.me_user()
+        return u.first_name if u is not None and u.first_name else "Я"
+
+    def friend_user(self):
+        try:
+            return get_messages_controller().getUser(Long(self.session["dialog"]))
+        except Exception:
+            return None
+
+    def friend_name(self, did):
+        try:
+            u = get_messages_controller().getUser(Long(did))
+            if u is not None and u.first_name:
+                return u.first_name
+        except Exception:
+            pass
+        return "друг"
+
+    def notify(self, text):
+        if self.get_setting("notify", True):
+            BulletinHelper.show_info(text)
+
+    # ---------- экранный интерфейс ----------
+
+    def open_overlay(self):
+        if self.overlay is not None and self.overlay.alive:
+            return
+        pv, player = self.session_player()
+        if player is None:
+            return
+        try:
+            self.overlay = Overlay(self, pv)
+        except Exception as e:
+            self.overlay = None
+            self.logger.error(f"overlay: {e}")
+
+    def close_overlay(self):
+        if self.overlay is not None:
+            self.overlay.remove()
+            self.overlay = None
+
+    def on_viewer_closed(self):
+        self.bound = None
+        run_on_ui_thread(self.close_overlay)
+
+    def set_controls_visible(self, show):
+        if self.overlay is not None:
+            self.overlay.set_controls_visible(show)
 
     # ---------- плеер ----------
 
@@ -362,15 +790,12 @@ class WtogetherPlugin(BasePlugin):
     def on_video_opened(self):
         self.quiet_until = time.time() + QUIET
         if not self.session.get("accepted"):
-            # открыл видео из приглашения — считаем, что принял
             self.session["accepted"] = True
             self.send_cmd({"t": "accept"})
-        name = self.friend_name(self.session["dialog"])
+        run_on_ui_thread(self.open_overlay, 300)
         if self.remote:
-            BulletinHelper.show_info(f"🔗 Подключаюсь к {name}…")
             run_on_ui_thread(self.apply_remote, 800)
         else:
-            BulletinHelper.show_info(f"🔗 Вместе с {name}. Ждём, когда друг откроет видео")
             self.send_cmd({"t": "ask"})
 
     def read_state(self):
@@ -425,7 +850,7 @@ class WtogetherPlugin(BasePlugin):
             self.logger.error(f"apply_remote: {e}")
 
     def toggle(self, pv, player, want_play):
-        # через просмотрщик, чтобы кнопка ▶/⏸ на экране тоже переключилась
+        # через просмотрщик, чтобы его кнопка ▶/⏸ тоже переключилась
         try:
             m = self.pv_class.getDeclaredMethod("toggleVideoPlayer")
             m.setAccessible(True)
@@ -444,7 +869,9 @@ class WtogetherPlugin(BasePlugin):
         t = cmd.get("t")
         if t == "st":
             return ("▶️ смотрим с " if cmd["p"] else "⏸ пауза на ") + fmt_time(cmd["pos"])
-        return {"ask": "🔄 подключаюсь", "stop": "⏹ просмотр закончен",
+        if t == "msg":
+            return "💬 " + cmd.get("x", "")
+        return {"ask": "🔄 подключаюсь", "stop": "⏹ просмотр закончен", "voice": "📞 звоню",
                 "accept": "✅ принял(а) приглашение", "decline": "🙅 отказался(ась)"}.get(t, t or "")
 
     def send_cmd(self, cmd, did=None, doc=None):
@@ -454,7 +881,7 @@ class WtogetherPlugin(BasePlugin):
         if not did:
             return
         cmd["d"] = doc
-        text = "🎬 Wtogether: " + self.human(cmd) + "\n" + TAG + json.dumps(cmd, separators=(",", ":"))
+        text = "🎬 Wtogether: " + self.human(cmd) + "\n" + TAG + json.dumps(cmd, separators=(",", ":"), ensure_ascii=False)
         try:
             req = TLRPC.TL_messages_sendMessage()
             req.peer = get_messages_controller().getInputPeer(Long(did))
@@ -520,19 +947,6 @@ class WtogetherPlugin(BasePlugin):
             self.logger.error(f"on_updates_hook: {e}")
         return HookResult()
 
-    def friend_name(self, did):
-        try:
-            u = get_messages_controller().getUser(Long(did))
-            if u is not None and u.first_name:
-                return u.first_name
-        except Exception:
-            pass
-        return "друг"
-
-    def notify(self, text):
-        if self.get_setting("notify", True):
-            BulletinHelper.show_info(text)
-
     def on_invite(self, did, doc):
         name = self.friend_name(did)
         self.start_session(did, doc, accepted=False)
@@ -554,7 +968,8 @@ class WtogetherPlugin(BasePlugin):
                 self.clear_session()
 
         self.dialog(f"🎬 {name} зовёт смотреть вместе",
-                    "Откройте это видео оба: пауза, перемотка и скорость будут общими.\n\n"
+                    "Откройте это видео оба: пауза, перемотка и скорость будут общими. "
+                    "Поверх видео появятся ваши аватарки, кнопки, сообщения и звонок.\n\n"
                     "Видео — в сообщении, на которое ответил друг.",
                     positive=("Смотреть", accept),
                     negative=("Отказаться", decline),
@@ -600,11 +1015,24 @@ class WtogetherPlugin(BasePlugin):
                 self.notify(f"⏹ {name} закончил(а) совместный просмотр")
             return True
 
-        # команда к другому видео или после перезапуска: подхватываем сессию
         if not mine or self.session["doc"] != doc:
             self.start_session(did, doc, accepted=True)
         self.session["accepted"] = True
         self.session["friend_open"] = True
+
+        if t == "msg":
+            text = str(cmd.get("x") or "")[:300]
+            at = int(cmd.get("at") or 0)
+            self.talk.append((at, name, text))
+            if self.overlay is not None:
+                run_on_ui_thread(lambda: self.overlay and self.overlay.bubble(name, text))
+            else:
+                BulletinHelper.show_info(f"💬 {name}: {text}")
+            return True
+
+        if t == "voice":
+            self.notify(f"📞 {name} звонит — обсуждайте голосом")
+            return True
 
         if t == "ask":
             self.notify(f"🔗 {name} открыл(а) видео")
@@ -616,8 +1044,10 @@ class WtogetherPlugin(BasePlugin):
             self.remote = {"p": bool(cmd.get("p")), "pos": int(cmd.get("pos") or 0),
                            "r": float(cmd.get("r") or 1.0), "ts": int(cmd.get("ts") or now_ms())}
             self.remote_at = now_ms()
-            if prev is None or prev["p"] != self.remote["p"]:
+            if (prev is None or prev["p"] != self.remote["p"]) and self.overlay is None:
                 self.notify(f"{name}: " + self.human(cmd))
+            elif self.overlay is not None and (prev is None or prev["p"] != self.remote["p"]):
+                run_on_ui_thread(lambda: self.overlay and self.overlay.bubble(name, self.human(cmd)))
             run_on_ui_thread(self.apply_remote)
             return True
 

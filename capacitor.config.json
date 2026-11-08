@@ -1,0 +1,7 @@
+{
+  "appId": "com.wtogether.app",
+  "appName": "Wtogether",
+  "webDir": "www",
+  "backgroundColor": "#141d26",
+  "android": { "allowMixedContent": true }
+}

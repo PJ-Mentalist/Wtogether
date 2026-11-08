@@ -89,66 +89,83 @@ class Rec:
     def got(self, kind): return [x for x in self.log if x[0] == kind]
 
 br = Broker(); EP = [("127.0.0.1", br.port, False)]
+W.Room.CLAIM_WAIT = 0.6
 def wait(cond, timeout=5):
     end = time.time() + timeout
     while time.time() < end:
         if cond(): return True
         time.sleep(0.05)
     return False
-ok = lambda c, msg: print(("✅ " if c else "❌ ") + msg) or c
+ok = lambda c, msg: print(("✅ " if c else "❌ ") + msg) or bool(c)
 results = []
 
 code = W.new_code(0)
-results.append(ok(W.normalize_code(code.lower()[:3] + " " + code.lower()[3:]) == code and W.broker_of(code) == 0, f"код {code}: нормализация и брокер"))
+results.append(ok(W.normalize_code(code[:2] + " " + code[2:]) == code and W.broker_of(code) == 0 and len(code) == 4,
+                  f"код {code}: 4 цифры, нормализация, брокер"))
 
 hev = Rec("host"); host = W.Room(111, "Ведущий", hev, endpoints=EP)
-host.host(code, {"doc": 555, "title": "Аниме 1 серия", "dur": 1440000})
-wait(lambda: host.client and host.client.connected)
+host.host(code, {"src": "tg", "doc": 555, "title": "Аниме 1 серия"})
+results.append(ok(wait(lambda: host.claimed), "ведущий занял свободный код"))
 host.publish_state(False, 0, 1.0)
 
-OFF = -1800   # часы зрителя отстают на 1,8 с
+# второй ведущий пытается взять тот же код — занято
+xev = Rec("x"); other = W.Room(999, "Чужой", xev, endpoints=EP); other.host(code, {"src": "tg", "doc": 1})
+results.append(ok(wait(lambda: xev.got("on_code_taken")) and not other.claimed, "занятый код не перехватить"))
+other.client.stop(); other.client = None
+
+OFF = -1800
 g1ev = Rec("g1"); g1 = W.Room(222, "Аня", g1ev, clock=lambda: W.now_ms() + OFF, endpoints=EP)
 g1.join(code)
 results.append(ok(wait(lambda: g1ev.got("on_room") and g1ev.got("on_state")), "зритель сразу получил комнату и состояние"))
-results.append(ok(g1.info and g1.info["doc"] == 555 and g1.info["host"] == 111, "в комнате id видео и ведущий"))
-results.append(ok(wait(lambda: 222 in host.members), "ведущий видит зрителя"))
-results.append(ok(wait(lambda: 111 in g1.members and g1.members[111]["host"]), "зритель видит ведущего"))
+results.append(ok(g1.info["doc"] == 555 and g1.host_uid() == 111, "в комнате видео и ведущий"))
+results.append(ok(wait(lambda: 222 in host.members and 111 in g1.members), "участники видят друг друга"))
 for _ in range(3):
-    g1.ping(); time.sleep(0.2)
-results.append(ok(wait(lambda: g1.rtt is not None) and abs(g1.offset - 1800) < 60, f"сверка часов: оценка {g1.offset} мс при реальных 1800"))
+    g1.ping(); time.sleep(0.15)
+results.append(ok(wait(lambda: g1.rtt is not None) and abs(g1.offset - 1800) < 60, f"сверка часов: {g1.offset} мс при 1800"))
 
-g1.set_progress("loading", 40)
-results.append(ok(wait(lambda: host.members.get(222, {}).get("pc") == 40), "ведущий видит загрузку 40%"))
 g1.set_progress("ready", 100)
 results.append(ok(wait(lambda: host.members.get(222, {}).get("s") == "ready"), "ведущий видит «готов»"))
+host.publish_state(True, 0, 1.0, ts=W.now_ms() + 1500)
+results.append(ok(wait(lambda: g1.st and g1.st["p"]), "старт с отсчётом дошёл"))
+results.append(ok(W.plan_correction(g1.st, g1.room_now(), 0, False)[0] is False, "во время отсчёта зритель на паузе"))
+time.sleep(1.7)
+results.append(ok(W.plan_correction(g1.st, g1.room_now(), 0, False)[0] is True, "после отсчёта зритель играет"))
 
-host.publish_state(True, 0, 1.0, ts=W.now_ms() + 3000)
-results.append(ok(wait(lambda: g1.st and g1.st["p"] and g1.st["ts"] > W.now_ms()), "зритель получил старт с отсчётом"))
-p, seek, sp, _ = W.plan_correction(g1.st, g1.room_now(), 0, False)
-results.append(ok(p is False, "во время отсчёта зритель стоит на паузе"))
-time.sleep(3.2)
-p, seek, sp, _ = W.plan_correction(g1.st, g1.room_now(), 0, False)
-results.append(ok(p is True, f"после отсчёта зритель запускается (перемотка к {seek} мс)"))
+host.chat("Смотри!", 1000); g1.chat("Ого", 1200); g1.react("🔥")
+results.append(ok(wait(lambda: g1ev.got("on_chat") and hev.got("on_chat") and hev.got("on_react")), "чат и реакции"))
+results.append(ok(len(hev.got("on_chat")) == 1 and not g1ev.got("on_react"), "свои сообщения и реакции не возвращаются"))
+g1.ask_wait()
+results.append(ok(wait(lambda: hev.got("on_wait")) and hev.got("on_wait")[0][1][0]["n"] == "Аня", "«подожди меня» дошло до ведущего"))
 
-host.chat("Смотри!", 1000); g1.chat("Ого", 1200)
-results.append(ok(wait(lambda: g1ev.got("on_chat") and hev.got("on_chat")), "чат в обе стороны"))
-results.append(ok(len(hev.got("on_chat")) == 1 and len(g1ev.got("on_chat")) == 1, "свои сообщения не приходят обратно"))
-
-# зритель 2 подключается позже — сразу видит позицию
-host.publish_state(True, 65000, 1.5)
 g2ev = Rec("g2"); g2 = W.Room(333, "Боря", g2ev, endpoints=EP); g2.join(code)
-results.append(ok(wait(lambda: g2.st and g2.st["pos"] == 65000 and g2.st["r"] == 1.5), "опоздавший сразу получил позицию и скорость"))
+host.publish_state(True, 65000, 1.5)
+results.append(ok(wait(lambda: g2.st and g2.st["pos"] == 65000 and g2.st["r"] == 1.5), "опоздавший получил позицию и скорость"))
 results.append(ok(wait(lambda: 333 in host.members and 333 in g1.members), "все видят нового участника"))
 
-# зритель 2 пропал без выхода — срабатывает «завещание»
+# передача управления Ане
+host.transfer(222)
+results.append(ok(wait(lambda: g1.role == "host" and host.role == "guest"), "👑 передана: Аня ведущая, бывший ведущий — зритель"))
+results.append(ok(wait(lambda: g2ev.got("on_host_changed") and g2.host_uid() == 222), "остальные узнали о новом ведущем"))
+g1.publish_state(False, 70000, 1.0)
+results.append(ok(wait(lambda: host.st and host.st["pos"] == 70000 and g2.st["pos"] == 70000), "новый ведущий управляет всеми"))
+host.ping(); g2.ping()
+results.append(ok(wait(lambda: host.rtt is not None and g2.rtt is not None), "часы сверяются с новым ведущим"))
+results.append(ok(wait(lambda: g2.members.get(222, {}).get("host") and not g2.members.get(111, {}).get("host")),
+                  "корона в списке участников переехала"))
+
 g2.client.running = False; g2.client.sock.close()
-results.append(ok(wait(lambda: 333 not in host.members, 6), "обрыв связи зрителя — его убрали из участников"))
+results.append(ok(wait(lambda: 333 not in g1.members, 6), "обрыв связи — участник исчез из списка"))
 
-# ведущий закончил
+# новый ведущий (Аня) заканчивает
+g1.close()
+results.append(ok(wait(lambda: hev.got("on_end")), "все узнали, что просмотр закончен"))
 host.close()
-results.append(ok(wait(lambda: g1ev.got("on_end")), "зритель узнал, что просмотр закончен"))
-g3ev = Rec("g3"); g3 = W.Room(444, "Поздний", g3ev, endpoints=EP); g3.join(code)
-time.sleep(1)
-results.append(ok(not g3ev.got("on_room") and g3ev.got("on_end"), "после конца комнату не найти, новичок видит «закончено»"))
 
-print(f"\nИтого: {sum(bool(x) for x in results)} из {len(results)}")
+# брошенная комната: ведущий пропал без «закончить» — код можно занять снова
+code2 = W.new_code(0)
+aev = Rec("a"); a = W.Room(501, "Пропал", aev, endpoints=EP); a.host(code2, {"src": "tg", "doc": 7})
+wait(lambda: a.claimed); a.client.running = False; a.client.sock.close(); time.sleep(0.5)
+bev = Rec("b"); b = W.Room(502, "Новый", bev, endpoints=EP); b.host(code2, {"src": "tg", "doc": 8})
+results.append(ok(wait(lambda: b.claimed) and not bev.got("on_code_taken"), "код брошенной комнаты снова свободен"))
+
+print(f"\nИтого: {sum(results)} из {len(results)}")

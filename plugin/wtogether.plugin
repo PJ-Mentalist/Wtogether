@@ -1,22 +1,22 @@
 """
-Wtogether для exteraGram 3.0 — совместный просмотр видео по коду комнаты.
+Wtogether для exteraGram 4.0 — смотрим видео вместе.
 
-1. Ведущий: долгое нажатие на видео → Плагины → «🎬 Смотреть вместе».
-   Создаётся комната с кодом (например K7P4QD) и открывается плеер.
-2. Ведущий отправляет код другу (кнопкой «Отправить в чат» или как угодно).
-3. Друг: «Войти по коду» (настройки плагина, меню чата ⋮ → «🎬 Wtogether» или боковое меню),
-   либо «Смотреть» во всплывшем окне, если код пришёл сообщением.
-   Плагин сам находит это видео у друга в Telegram и загружает его.
-4. В лобби видно, кто готов. Ведущий жмёт «Начать для всех» — отсчёт и одновременный старт.
-5. Управляет только ведущий 👑, у зрителей всё повторяется и плавно подстраивается.
+• Комната: долгое нажатие на видео → Плагины → «🎬 Смотреть вместе», или «Смотреть по ссылке»
+  (YouTube, .mp4, .m3u8) в меню Wtogether. Код комнаты — 4 цифры.
+• Позвать: «Пригласить» — у друга в чате карточка с «▶️ Войти в комнату» (один тап),
+  или код в «Войти по коду».
+• Плеер в стиле exteraGram: иконки Telegram, плавающая панель, лобби с готовностью,
+  отсчёт 3‑2‑1, реакции, чат сбоку, жесты, мини-плеер, звонок.
+• Управляет ведущий 👑 (можно передать). Зрители держатся рядом сами; «✋ Подожди меня».
 
-Связь идёт через публичный MQTT-брокер, а не через сообщения: в чат не пишется ничего,
-кроме одного сообщения с кодом (по желанию). Плагин нужен у всех участников.
+Связь — через публичный MQTT-брокер, не через сообщения: в чат ничего не пишется,
+кроме приглашения. Плагин нужен у всех участников.
 """
-from base_plugin import BasePlugin, HookResult, MenuItemData, MenuItemType
+from base_plugin import BasePlugin, HookResult, MenuItemData, MenuItemType, MethodHook
+from hook_utils import find_class
 from client_utils import (send_request, send_text, get_messages_controller, get_last_fragment,
                           get_file_loader, get_notification_center)
-from android_utils import run_on_ui_thread, OnClickListener, copy_to_clipboard
+from android_utils import run_on_ui_thread, OnClickListener, copy_to_clipboard, R
 from ui.bulletin import BulletinHelper
 from ui.alert import AlertDialogBuilder
 from ui.settings import Header, Switch, Text, Divider
@@ -27,9 +27,9 @@ from org.telegram.messenger import MessageObject, NotificationCenter
 
 __id__ = "wtogether"
 __name__ = "Wtogether"
-__description__ = "Совместный просмотр видео по коду комнаты: ведущий управляет, у всех синхронно, без спама в чат"
+__description__ = "Смотрите видео вместе: комнаты по коду, ведущий управляет, реакции, чат, жесты, мини-плеер"
 __author__ = "Wtogether"
-__version__ = "3.0.0"
+__version__ = "4.0.0"
 # Иконка: имя_набора_стикеров/номер. После создания своего набора через @Stickers замени на "ИмяНабора/0"
 __icon__ = "exteraPlugins/1"
 __category__ = ["media", "chats"]
@@ -41,13 +41,17 @@ SEEK_COOLDOWN = 1.5      # с: после перемотки даём плеер
 PING_EVERY = 20.0        # с: зритель уточняет разницу часов
 SKIP_MS = 10000
 SPEEDS = [1.0, 1.25, 1.5, 2.0, 0.75]
+JOIN_HOST = "wtogether.join/"
 
-ACCENT = "#3E8EF7"
-DARK = "#99000000"
-PANEL = "#CC0B0F14"
-ONLINE = "#4CD964"
-OFFLINE = "#8E8E93"
-WAITING = "#FFB340"
+ACCENT = "#FF3E8EF7"
+ONLINE = "#FF4CD964"
+OFFLINE = "#FF8E8E93"
+WAITING = "#FFFFB340"
+
+
+def html_escape(s):
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
 
 # ===== PURE START — чистый Python без Android, проверяется тестами в plugin/tools =====
 import json
@@ -57,8 +61,8 @@ import ssl
 import threading
 import time
 
-NS = "wtogether3"
-CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"   # без 0/O и 1/I
+NS = "wtogether4"
+CODE_LEN = 4
 # Публичные бесплатные MQTT-брокеры. Код комнаты указывает, на каком брокере она живёт.
 BROKERS = [
     ("broker.emqx.io", [(1883, False), (8883, True)]),
@@ -86,20 +90,39 @@ def fmt_time(ms):
 
 
 def new_code(broker_index):
-    """6 символов; первый кодирует брокер, чтобы все пришли на один и тот же."""
+    """4 цифры; первая говорит, на каком брокере комната (цифра % число брокеров)."""
     n = len(BROKERS)
-    first = [c for i, c in enumerate(CODE_ALPHABET) if i % n == broker_index]
-    return random.choice(first) + "".join(random.choice(CODE_ALPHABET) for _ in range(5))
+    first = random.choice([d for d in "0123456789" if int(d) % n == broker_index])
+    return first + "".join(random.choice("0123456789") for _ in range(CODE_LEN - 1))
 
 
 def normalize_code(text):
-    """«k7p 4qd» → «K7P4QD». None, если это не код."""
-    code = "".join(c for c in str(text or "").upper() if c.isalnum())
-    return code if len(code) == 6 and all(c in CODE_ALPHABET for c in code) else None
+    """«48 21» → «4821». None, если это не код."""
+    code = "".join(c for c in str(text or "") if c.isdigit())
+    return code if len(code) == CODE_LEN else None
 
 
 def broker_of(code):
-    return CODE_ALPHABET.index(code[0]) % len(BROKERS)
+    return int(code[0]) % len(BROKERS)
+
+
+def youtube_id(url):
+    import re
+    m = re.search(r"(?:youtu\.be/|youtube(?:-nocookie)?\.com/(?:watch\?(?:.*&)?v=|embed/|shorts/|live/|v/))([\w-]{11})",
+                  url or "")
+    return m.group(1) if m else None
+
+
+def media_from_url(url):
+    """Ссылка → описание источника для комнаты или None."""
+    url = (url or "").strip()
+    if not url.lower().startswith(("http://", "https://")):
+        return None
+    yt = youtube_id(url)
+    if yt:
+        return {"src": "yt", "yt": yt, "title": "YouTube"}
+    name = url.split("?")[0].rstrip("/").split("/")[-1] or "Видео по ссылке"
+    return {"src": "url", "url": url, "title": name[:60]}
 
 
 def zw_encode(obj):
@@ -365,30 +388,33 @@ class MqttClient:
 # ---------- комната ----------
 
 class Room:
-    """Протокол комнаты поверх MQTT.
-    Топики (все под NS/КОД/):
-      room        — инфо о комнате (retained, ведущий)
-      st          — состояние воспроизведения (retained, ведущий)
-      end         — ведущий закончил (retained)
-      p/<uid>     — присутствие участника (retained; «завещание» = ушёл)
-      chat        — сообщения
-      ping/<uid>, pong/<uid> — сверка часов
+    """Протокол комнаты поверх MQTT. Топики под NS/КОД/:
+      room      — инфо: источник видео, ведущий (retained). Смена поля host = передача управления
+      st        — состояние воспроизведения (retained, пишет текущий ведущий)
+      end       — ведущий закончил (retained)
+      p/<uid>   — присутствие участника (retained; «завещание» — ушёл)
+      chat, react, wait — сообщения, реакции, просьба «подожди меня»
+      ping/<uid>, pong/<uid> — сверка часов с ведущим
     """
+
+    CLAIM_WAIT = 1.5    # с: сколько ждём, не занят ли код, прежде чем занять
 
     def __init__(self, uid, name, events, clock=now_ms, client_factory=None, endpoints=None):
         self.uid = int(uid)
         self.name = name
-        self.ev = events            # объект с методами on_*
+        self.ev = events
         self.clock = clock
         self.code = None
         self.role = None
         self.info = None
         self.st = None
-        self.members = {}           # uid -> {"n", "s", "pc", "host"}
-        self.offset = 0             # часы ведущего − мои
+        self.members = {}
+        self.offset = 0
         self.rtt = None
         self.samples = []
         self.ended = False
+        self.claimed = False
+        self.foreign = None          # чужая комната с этим кодом, замеченная до занятия
         self.presence = {"s": "joined", "pc": 0}
         self._client_factory = client_factory or MqttClient
         self._endpoints = endpoints
@@ -400,6 +426,9 @@ class Room:
     def t(self, suffix):
         return f"{NS}/{self.code}/{suffix}"
 
+    def host_uid(self):
+        return self.uid if self.role == "host" else int((self.info or {}).get("host") or 0)
+
     def room_now(self):
         return self.clock() + (self.offset if self.role == "guest" else 0)
 
@@ -409,29 +438,50 @@ class Room:
         host, ports = BROKERS[broker_of(code)]
         return [(host, p, tls) for p, tls in ports]
 
+    def _emit(self, name, *args, **kw):
+        cb = getattr(self.ev, name, None)
+        if cb:
+            cb(*args, **kw)
+
     def _start(self):
         self.client = self._client_factory(self._on_message, self._on_connect, self._on_status,
                                            getattr(self.ev, "on_log", None))
-        will = (self.t(f"p/{self.uid}"), {"s": "gone"}, True)
-        self.client.configure(self._endpoints_for(self.code), will)
+        self.client.configure(self._endpoints_for(self.code), (self.t(f"p/{self.uid}"), {"s": "gone"}, True))
         self.client.subscribe(f"{NS}/{self.code}/#")
         self.client.start()
 
     def _on_status(self, s):
         self.status = s
-        cb = getattr(self.ev, "on_status", None)
-        if cb:
-            cb(s)
+        self._emit("on_status", s)
 
     def _on_connect(self):
         self._publish_presence()
         if self.role == "host":
-            self.client.publish(self.t("end"), b"", retain=True)
-            self.client.publish(self.t("room"), self.info, retain=True)
-            if self.st is not None:
-                self.client.publish(self.t("st"), self.st, retain=True)
+            if self.claimed:
+                self._publish_room()
+            else:
+                threading.Timer(self.CLAIM_WAIT, self._claim).start()
         else:
             self.ping()
+
+    def _claim(self):
+        """Код свободен, если нет комнаты или её ведущий не в сети."""
+        f = self.foreign
+        if f and int(f.get("host") or 0) in self.members:
+            self._emit("on_code_taken")
+            return
+        self.claimed = True
+        self._publish_room()
+        self._emit("on_claimed")
+
+    def _publish_room(self):
+        c = self.client
+        if c is None:
+            return
+        c.publish(self.t("end"), b"", retain=True)
+        c.publish(self.t("room"), self.info, retain=True)
+        if self.st is not None:
+            c.publish(self.t("st"), self.st, retain=True)
 
     def _publish_presence(self):
         p = dict(self.presence)
@@ -444,14 +494,22 @@ class Room:
 
     def host(self, code, info):
         self.role, self.code = "host", code
-        self.info = dict(info, host=self.uid, hn=self.name, v=3)
+        self.info = dict(info, host=self.uid, hn=self.name, v=4)
         self.presence = {"s": "ready", "pc": 100}
         self._start()
 
     def publish_state(self, p, pos, r, ts=None):
         self.st = {"p": bool(p), "pos": int(pos), "r": float(r), "ts": int(ts if ts is not None else self.clock())}
-        if self.client is not None:
+        if self.client is not None and self.claimed:
             self.client.publish(self.t("st"), self.st, retain=True)
+
+    def transfer(self, uid):
+        """Отдать управление участнику uid."""
+        if self.role != "host" or uid not in self.members:
+            return False
+        self.info = dict(self.info, host=int(uid), hn=self.members[uid].get("n") or "")
+        self.client.publish(self.t("room"), self.info, retain=True)
+        return True
 
     # --- зритель ---
 
@@ -467,7 +525,11 @@ class Room:
         self.presence = {"s": stage, "pc": int(pc)}
         self._publish_presence()
 
-    # --- общее ---
+    def ask_wait(self):
+        if self.client is not None:
+            self.client.publish(self.t("wait"), {"u": self.uid, "n": self.name})
+
+    # --- все ---
 
     def chat(self, text, at):
         msg = {"u": self.uid, "n": self.name, "x": text[:300], "at": int(at)}
@@ -475,12 +537,16 @@ class Room:
             self.client.publish(self.t("chat"), msg)
         return msg
 
+    def react(self, emoji):
+        if self.client is not None:
+            self.client.publish(self.t("react"), {"u": self.uid, "n": self.name, "e": emoji[:8]})
+
     def close(self):
         """Ведущий — закончить для всех, зритель — выйти."""
         c = self.client
         if c is None:
             return
-        if self.role == "host":
+        if self.role == "host" and self.claimed:
             c.publish(self.t("end"), {"end": 1, "ts": self.clock()}, retain=True)
             c.publish(self.t("st"), b"", retain=True)
             c.publish(self.t("room"), b"", retain=True)
@@ -502,19 +568,43 @@ class Room:
                 data = json.loads(payload.decode("utf-8"))
             except Exception:
                 return
-        ev = self.ev
+
         if key == "room":
-            if data and self.role == "guest":
-                self.info = data
-                ev.on_room(data)
+            if not data:
+                return
+            new_host = int(data.get("host") or 0)
+            if self.role == "host" and not self.claimed:
+                if new_host != self.uid:
+                    self.foreign = data
+                return
+            prev_host = self.host_uid()
+            self.info = data
+            if self.role == "guest" and new_host == self.uid:
+                self.role = "host"
+                self.claimed = True
+                self.offset, self.samples = 0, []
+                self._publish_presence()
+                self._emit("on_role", "host")
+            elif self.role == "host" and new_host != self.uid:
+                self.role = "guest"
+                self.samples = []
+                self._publish_presence()
+                self.ping()
+                self._emit("on_role", "guest")
+            elif self.role == "guest":
+                if prev_host and prev_host != new_host:
+                    self.samples = []
+                    self.ping()
+                    self._emit("on_host_changed", new_host)
+                self._emit("on_room", data)
         elif key == "st":
             if data and self.role == "guest":
                 self.st = data
-                ev.on_state(data)
+                self._emit("on_state", data)
         elif key == "end":
             if data and self.role == "guest" and not self.ended:
                 self.ended = True
-                ev.on_end()
+                self._emit("on_end")
         elif key.startswith("p/"):
             try:
                 uid = int(key[2:])
@@ -524,14 +614,20 @@ class Room:
                 return
             if not data or data.get("s") == "gone":
                 if self.members.pop(uid, None) is not None:
-                    ev.on_members(self.members, left=uid)
+                    self._emit("on_members", self.members, left=uid)
             else:
                 new = uid not in self.members
                 self.members[uid] = data
-                ev.on_members(self.members, joined=uid if new else None)
+                self._emit("on_members", self.members, joined=uid if new else None)
         elif key == "chat":
             if data and int(data.get("u") or 0) != self.uid:
-                ev.on_chat(data)
+                self._emit("on_chat", data)
+        elif key == "react":
+            if data and int(data.get("u") or 0) != self.uid:
+                self._emit("on_react", data)
+        elif key == "wait":
+            if data and self.role == "host" and int(data.get("u") or 0) != self.uid:
+                self._emit("on_wait", data)
         elif key.startswith("ping/") and self.role == "host" and data:
             self.client.publish(self.t("pong/" + key[5:]), {"a": data.get("a"), "b": self.clock()})
         elif key == f"pong/{self.uid}" and self.role == "guest" and data:
@@ -552,6 +648,8 @@ def listeners():
     from android.media import MediaPlayer
     from android.widget import SeekBar
     from android.content import DialogInterface
+    from android.view import View
+    from android.webkit import ValueCallback
 
     class Prepared(dynamic_proxy(MediaPlayer.OnPreparedListener)):
         def __init__(self, fn):
@@ -575,8 +673,42 @@ def listeners():
             self.fn = fn
 
         def onError(self, mp, what, extra):
-            self.fn(what, extra)
+            self.fn(mp, what, extra)
             return True
+
+    class Info(dynamic_proxy(MediaPlayer.OnInfoListener)):
+        def __init__(self, fn):
+            super().__init__()
+            self.fn = fn
+
+        def onInfo(self, mp, what, extra):
+            self.fn(mp, what, extra)
+            return False
+
+    class Touch(dynamic_proxy(View.OnTouchListener)):
+        def __init__(self, fn):
+            super().__init__()
+            self.fn = fn
+
+        def onTouch(self, v, e):
+            self.fn(v, e)
+            return True
+
+    class Dismissed(dynamic_proxy(DialogInterface.OnDismissListener)):
+        def __init__(self, fn):
+            super().__init__()
+            self.fn = fn
+
+        def onDismiss(self, d):
+            self.fn(d)
+
+    class Value(dynamic_proxy(ValueCallback)):
+        def __init__(self, fn):
+            super().__init__()
+            self.fn = fn
+
+        def onReceiveValue(self, v):
+            self.fn(v)
 
     class Seek(dynamic_proxy(SeekBar.OnSeekBarChangeListener)):
         def __init__(self, on_change, on_start, on_stop):
@@ -604,22 +736,13 @@ def listeners():
                 return True
             return False
 
-    class Dismissed(dynamic_proxy(DialogInterface.OnDismissListener)):
-        def __init__(self, fn):
-            super().__init__()
-            self.fn = fn
-
-        def onDismiss(self, dialog):
-            self.fn()
-
-    listeners.cache = dict(Prepared=Prepared, Completed=Completed, Failed=Failed,
-                           Seek=Seek, Keys=Keys, Dismissed=Dismissed)
+    listeners.cache = dict(Prepared=Prepared, Completed=Completed, Failed=Failed, Info=Info, Touch=Touch,
+                           Dismissed=Dismissed, Value=Value, Seek=Seek, Keys=Keys)
     return listeners.cache
 
 
 def make_new_messages_observer(plugin):
-    """Запасной путь приёма команд — если хук обновлений не сработал.
-    Класс создаётся внутри функции: если что-то пойдёт не так, плагин всё равно загрузится."""
+    """Ловим сообщения с кодом комнаты, чтобы предложить войти."""
     class NewMessages(dynamic_proxy(NotificationCenter.NotificationCenterDelegate)):
         def __init__(self):
             super().__init__()
@@ -634,384 +757,1020 @@ def make_new_messages_observer(plugin):
     return NewMessages()
 
 
-# ---------------- плеер ----------------
+class JoinLinkHook(MethodHook):
+    """Нажатие на ссылку https://wtogether.join/КОД открывает комнату, а не браузер."""
+    def __init__(self, plugin):
+        self.plugin = plugin
 
-class Player:
-    """Полноэкранный плеер Wtogether."""
+    def before_hooked_method(self, param):
+        try:
+            for a in (param.args or []):
+                if a is None:
+                    continue
+                s = str(a)
+                i = s.find(JOIN_HOST)
+                if i >= 0:
+                    code = normalize_code(s[i + len(JOIN_HOST):i + len(JOIN_HOST) + 8])
+                    if code:
+                        try:
+                            rt = str(param.method.getReturnType().getName())
+                        except Exception:
+                            rt = "void"
+                        param.setResult(False if rt == "boolean" else None)
+                        run_on_ui_thread(lambda: self.plugin.run_safe(lambda: self.plugin.join_code(code)))
+                    return
+        except Exception as e:
+            self.plugin.log_err(f"ссылка: {e}")
 
-    def __init__(self, plugin, mo):
-        from android.app import Dialog
-        from android import R as AR
-        from android.view import WindowManager
 
-        self.p = plugin
-        self.mo = mo
-        self.alive = True
-        self.vv = None
+# ---------------- оформление ----------------
+
+ICONS = {
+    "play": ["pip_play_large", "ic_action_play", "ic_play"],
+    "pause": ["pip_pause_large", "ic_action_pause", "ic_pause"],
+    "close": ["ic_close_white", "msg_close", "ic_layer_close"],
+    "retry": ["msg_retry"],
+    "chat": ["msg_discussion", "msg_discuss"],
+    "react": ["msg_reactions", "filled_reactions"],
+    "more": ["ic_ab_other", "msg_more", "mini_more_dots"],
+    "speed": ["msg_speed", "msg_speed_normal"],
+    "hand": ["menu_feature_hands", "msg_handdown"],
+    "crown": ["filled_crown_on", "filled_stream_crown"],
+    "link": ["msg_link", "msg_link2"],
+    "call": ["msg_calls", "calls_menu_phone"],
+    "pip": ["menu_video_pip", "msg_voice_pip", "pip_video_expand"],
+    "expand": ["pip_enlarge", "pip_video_expand", "msg_expand"],
+    "rotate": ["ic_gofullscreen", "iv_fullscreen"],
+    "send": ["msg_send", "ic_send"],
+    "users": ["msg_groups", "filled_calls_users"],
+    "volume": ["filled_sound_on", "voice_volume_mini"],
+    "bright": ["msg_brightness_high"],
+    "lock": ["ic_lock_white", "msg_mini_lock2"],
+    "copy": ["msg_copy"],
+    "share": ["msg_share", "msg_shareout"],
+    "leave": ["msg_leave", "msg_endcall"],
+}
+REACTIONS = ["❤️", "😂", "🔥", "😱", "👏", "😭", "🤯", "💀"]
+
+
+class UI:
+    """Общие помощники для построения интерфейса в стиле exteraGram."""
+
+    missing = set()
+    _res = {}
+
+    def __init__(self, ctx):
+        from android.widget import FrameLayout, LinearLayout, TextView, ImageView
+        from android.view import Gravity
+        from android.graphics import Color, Typeface
+        from android.graphics.drawable import GradientDrawable, RippleDrawable
+        from android.content.res import ColorStateList
+        from org.telegram.messenger import AndroidUtilities
+        self.ctx = ctx
+        self.FL, self.LL, self.TV, self.IV = FrameLayout, LinearLayout, TextView, ImageView
+        self.Gravity, self.Color, self.GD, self.Ripple, self.CSL = Gravity, Color, GradientDrawable, RippleDrawable, ColorStateList
+        self.dp = lambda v: AndroidUtilities.dp(float(v))
+        try:
+            self.bold = AndroidUtilities.bold()
+        except Exception:
+            self.bold = Typeface.DEFAULT_BOLD
+        self.accent = ACCENT
+        try:
+            from org.telegram.ui.ActionBar import Theme
+            c = int(Theme.getColor(Theme.key_featuredStickers_addButton))
+            self.accent = "#%08X" % (c & 0xFFFFFFFF)
+        except Exception:
+            pass
+
+    def c(self, color):
+        return self.Color.parseColor(color) if isinstance(color, str) else color
+
+    def shape(self, color, radius=0, oval=False, stroke=None):
+        d = self.GD()
+        d.setColor(self.c(color))
+        if oval:
+            d.setShape(self.GD.OVAL)
+        else:
+            d.setCornerRadius(float(radius))
+        if stroke:
+            d.setStroke(self.dp(1), self.c(stroke))
+        return d
+
+    def ripple(self, content, oval=False, radius=0):
+        mask = self.shape("#FFFFFFFF", radius, oval)
+        return self.Ripple(self.CSL.valueOf(self.c("#40FFFFFF")), content, mask)
+
+    def grad(self, top):
+        from java import jarray, jint
+        colors = jarray(jint)([self.c("#CC000000"), self.c("#00000000")])
+        o = self.GD.Orientation.TOP_BOTTOM if top else self.GD.Orientation.BOTTOM_TOP
+        return self.GD(o, colors)
+
+    def text(self, s, size=14.0, bold=False, color="#FFFFFFFF"):
+        t = self.TV(self.ctx)
+        t.setText(s)
+        t.setTextColor(self.c(color))
+        t.setTextSize(size)
+        if bold:
+            t.setTypeface(self.bold)
+        return t
+
+    def res(self, key):
+        if key in UI._res:
+            return UI._res[key]
+        rid = 0
+        try:
+            r = self.ctx.getResources()
+            pkg = self.ctx.getPackageName()
+            for name in ICONS.get(key, [key]):
+                rid = int(r.getIdentifier(name, "drawable", pkg))
+                if rid:
+                    break
+        except Exception:
+            rid = 0
+        if not rid:
+            UI.missing.add(key)
+        UI._res[key] = rid
+        return rid
+
+    def icon(self, key, fallback, size=24, color="#FFFFFFFF"):
+        rid = self.res(key)
+        if rid:
+            iv = self.IV(self.ctx)
+            iv.setImageResource(rid)
+            iv.setColorFilter(self.c(color))
+            iv.setScaleType(self.IV.ScaleType.FIT_CENTER)
+            return iv
+        t = self.text(fallback, size * 0.7, True, color)
+        t.setGravity(self.Gravity.CENTER)
+        return t
+
+    def icon_button(self, key, fallback, size, fn, bg="#26FFFFFF", icon_size=24, badge=False):
+        """Круглая кнопка с иконкой Telegram и «волной» при нажатии."""
+        dp = self.dp
+        box = self.FL(self.ctx)
+        box.setBackground(self.ripple(self.shape(bg, oval=True), oval=True))
+        box.setClickable(True)
+        ic = self.icon(key, fallback, icon_size)
+        box.addView(ic, self.FL.LayoutParams(dp(icon_size), dp(icon_size), self.Gravity.CENTER))
+        box.setOnClickListener(OnClickListener(lambda v: fn()))
+        box.setTag(ic)
+        if badge:
+            b = self.text("", 10.0, True)
+            b.setGravity(self.Gravity.CENTER)
+            b.setBackground(self.shape("#FFFF3B30", dp(9)))
+            b.setPadding(dp(4), 0, dp(4), 0)
+            b.setVisibility(8)
+            box.addView(b, self.FL.LayoutParams(-2, dp(18), self.Gravity.TOP | self.Gravity.END))
+            self.last_badge = b
+        return box
+
+    def seek_button(self, back, fn):
+        """«Перемотать на 10 с»: круговая стрелка и цифра 10, как в плеерах."""
+        dp = self.dp
+        box = self.FL(self.ctx)
+        box.setBackground(self.ripple(self.shape("#00000000", oval=True), oval=True))
+        box.setClickable(True)
+        rid = self.res("retry")
+        if rid:
+            iv = self.IV(self.ctx)
+            iv.setImageResource(rid)
+            iv.setColorFilter(self.c("#FFFFFFFF"))
+            if back:
+                iv.setScaleX(-1.0)
+            box.addView(iv, self.FL.LayoutParams(dp(30), dp(30), self.Gravity.CENTER))
+            n = self.text("10", 9.0, True)
+            n.setGravity(self.Gravity.CENTER)
+            box.addView(n, self.FL.LayoutParams(-2, -2, self.Gravity.CENTER))
+        else:
+            t = self.text("−10" if back else "+10", 15.0, True)
+            t.setGravity(self.Gravity.CENTER)
+            box.addView(t, self.FL.LayoutParams(-1, -1))
+        box.setOnClickListener(OnClickListener(lambda v: fn()))
+        return box
+
+    def pill_button(self, label, fn, color=None, icon=None, size=15.0):
+        dp = self.dp
+        row = self.LL(self.ctx)
+        row.setOrientation(self.LL.HORIZONTAL)
+        row.setGravity(self.Gravity.CENTER)
+        row.setPadding(dp(20), dp(12), dp(22), dp(12))
+        row.setBackground(self.ripple(self.shape(color or self.accent, dp(24)), radius=dp(24)))
+        row.setClickable(True)
+        if icon:
+            ic = self.icon(icon, "", 20)
+            lp = self.LL.LayoutParams(dp(20), dp(20))
+            lp.rightMargin = dp(8)
+            row.addView(ic, lp)
+        row.addView(self.text(label, size, True))
+        row.setOnClickListener(OnClickListener(lambda v: fn()))
+        return row
+
+    def avatar(self, user, name, size, dot=None, crown=False):
+        dp = self.dp
+        box = self.FL(self.ctx)
+        pic = None
+        try:
+            if user is not None:
+                from org.telegram.ui.Components import BackupImageView, AvatarDrawable
+                pic = BackupImageView(self.ctx)
+                pic.setRoundRadius(dp(size / 2))
+                pic.setForUserOrChat(user, AvatarDrawable(user))
+        except Exception:
+            pic = None
+        if pic is None:
+            pic = self.text((name or "?")[:1].upper(), size * 0.42, True)
+            pic.setGravity(self.Gravity.CENTER)
+            hue = ["#FF5E8BE0", "#FFE0705E", "#FF5EC27A", "#FFB45EE0", "#FFE0B45E", "#FF5EC7E0"][sum(map(ord, name or "?")) % 6]
+            pic.setBackground(self.shape(hue, oval=True))
+        box.addView(pic, self.FL.LayoutParams(dp(size), dp(size), self.Gravity.CENTER))
+        if dot:
+            d = self.TV(self.ctx)
+            d.setBackground(self.shape(dot, oval=True, stroke="#FF1C1C1E"))
+            box.addView(d, self.FL.LayoutParams(dp(max(9, size * 0.3)), dp(max(9, size * 0.3)),
+                                                self.Gravity.BOTTOM | self.Gravity.END))
+        if crown:
+            c = self.icon("crown", "👑", 14, "#FFFFC93C")
+            box.addView(c, self.FL.LayoutParams(dp(14), dp(14), self.Gravity.TOP | self.Gravity.END))
+        return box
+
+
+# ---------------- источники видео ----------------
+
+class VideoMedia:
+    """Файл или прямая ссылка (mp4, m3u8) через стандартный плеер Android."""
+    fine_speed = True
+
+    def __init__(self, player, ctx):
+        from android.widget import VideoView
+        self.pl = player
+        self.view = VideoView(ctx)
         self.mp = None
         self.prepared = False
         self.duration = 0
+        self.speed = 1.0
+        self.buffering = False
+        L = listeners()
+        run = player.p.run_safe
+        self.view.setOnPreparedListener(L["Prepared"](lambda mp: run(lambda: self._prepared(mp))))
+        self.view.setOnCompletionListener(L["Completed"](lambda mp: run(player.p.on_completed)))
+        self.view.setOnErrorListener(L["Failed"](lambda mp, w, e: run(lambda: player.on_error(f"код {w}/{e}"))))
+        self.view.setOnInfoListener(L["Info"](lambda mp, w, e: run(lambda: self._info(w))))
+
+    def open(self, path):
+        self.view.setVideoPath(path)
+
+    def _prepared(self, mp):
+        self.mp = mp
+        self.prepared = True
+        self.duration = int(mp.getDuration())
+        self.view.seekTo(0)
+        self.pl.on_prepared()
+
+    def _info(self, what):
+        if what == 701:
+            self.buffering = True
+            self.pl.p.on_buffering(True)
+        elif what == 702:
+            self.buffering = False
+            self.pl.p.on_buffering(False)
+
+    def position(self):
+        try:
+            return int(self.view.getCurrentPosition()) if self.prepared else 0
+        except Exception:
+            return 0
+
+    def playing(self):
+        try:
+            return bool(self.view.isPlaying())
+        except Exception:
+            return False
+
+    def seek_to(self, ms):
+        try:
+            if self.mp is not None:
+                self.mp.seekTo(int(ms), 3)   # SEEK_CLOSEST — точно в кадр
+                return
+        except Exception:
+            pass
+        self.view.seekTo(int(ms))
+
+    def play(self):
+        self.view.start()
+
+    def pause(self):
+        self.view.pause()
+
+    def set_speed(self, x):
+        params = self.mp.getPlaybackParams()
+        params.setSpeed(float(x))
+        self.mp.setPlaybackParams(params)
+
+    def poll(self):
+        pass
+
+    def release(self):
+        try:
+            self.view.stopPlayback()
+        except Exception:
+            pass
+
+
+YT_HTML = """<!doctype html><html><head><meta name=viewport content="width=device-width,initial-scale=1">
+<style>html,body,#p,iframe{margin:0;width:100%;height:100%;background:#000;overflow:hidden}</style></head>
+<body><div id=p></div><script src="https://www.youtube.com/iframe_api"></script><script>
+var P=null,R=false,E=0;
+function onYouTubeIframeAPIReady(){P=new YT.Player('p',{width:'100%',height:'100%',videoId:'__ID__',
+playerVars:{controls:0,playsinline:1,rel:0,modestbranding:1,disablekb:1,fs:0,iv_load_policy:3},
+events:{onReady:function(){R=true},onError:function(e){E=e.data}}});}
+function wt(){if(!P||!R)return JSON.stringify({r:0,e:E});
+return JSON.stringify({r:1,t:P.getCurrentTime()*1000,d:P.getDuration()*1000,s:P.getPlayerState(),v:P.getPlaybackRate(),e:E});}
+</script></body></html>"""
+
+
+class YouTubeMedia:
+    """YouTube через официальный встраиваемый плеер в WebView."""
+    fine_speed = False   # YouTube умеет только фиксированные скорости — подтягиваем перемоткой
+
+    def __init__(self, player, ctx):
+        from android.webkit import WebView
+        self.pl = player
+        self.view = WebView(ctx)
+        s = self.view.getSettings()
+        s.setJavaScriptEnabled(True)
+        s.setDomStorageEnabled(True)
+        s.setMediaPlaybackRequiresUserGesture(False)
+        self.view.setBackgroundColor(0xFF000000 - 0x100000000)
+        self.prepared = False
+        self.duration = 0
+        self.speed = 1.0
+        self.buffering = False
+        self._t = 0
+        self._t_at = time.time()
+        self._state = -1
+        self._err_shown = False
+        self._cb = listeners()["Value"](lambda v: player.p.run_safe(lambda: self._on_state(v)))
+
+    def open(self, video_id):
+        html = YT_HTML.replace("__ID__", video_id)
+        self.view.loadDataWithBaseURL("https://www.youtube.com", html, "text/html", "utf-8", None)
+
+    def js(self, code, cb=None):
+        self.view.evaluateJavascript(code, cb)
+
+    def poll(self):
+        self.js("wt()", self._cb)
+
+    def _on_state(self, raw):
+        try:
+            s = json.loads(json.loads(str(raw)))
+        except Exception:
+            return
+        err = int(s.get("e") or 0)
+        if err and not self._err_shown:
+            self._err_shown = True
+            self.pl.on_error("Автор запретил показывать это видео вне YouTube" if err in (101, 150, 152, 153)
+                             else f"YouTube не открыл видео (ошибка {err})")
+            return
+        if not s.get("r"):
+            return
+        self._t = float(s.get("t") or 0)
+        self._t_at = time.time()
+        self._state = int(s.get("s") if s.get("s") is not None else -1)
+        self.speed = float(s.get("v") or 1.0)
+        self.buffering = self._state == 3
+        d = int(s.get("d") or 0)
+        if d and not self.prepared:
+            self.duration = d
+            self.prepared = True
+            self.pl.on_prepared()
+        if self._state == 0:
+            self.pl.p.on_completed()
+
+    def position(self):
+        extra = (time.time() - self._t_at) * 1000 * self.speed if self._state == 1 else 0
+        return int(self._t + extra)
+
+    def playing(self):
+        return self._state in (1, 3)
+
+    def seek_to(self, ms):
+        self.js(f"P&&P.seekTo({ms / 1000.0:.3f},true)")
+        self._t, self._t_at = float(ms), time.time()
+
+    def play(self):
+        self.js("P&&P.playVideo()")
+        self._state = 1
+
+    def pause(self):
+        self.js("P&&P.pauseVideo()")
+        self._state = 2
+
+    def set_speed(self, x):
+        self.js(f"P&&P.setPlaybackRate({float(x)})")
+
+    def release(self):
+        try:
+            self.view.destroy()
+        except Exception:
+            pass
+
+
+# ---------------- плеер ----------------
+
+class Player:
+    """Полноэкранный плеер Wtogether в стиле exteraGram."""
+
+    def __init__(self, plugin, source):
+        from android.app import Dialog
+        from android import R as AR
+
+        self.p = plugin
+        self.source = source
+        self.alive = True
         self.dragging = False
         self.seek_block_until = 0.0
-        self.speed = 1.0
         self.countdown_at = 0
+        self.ui_shown = True
+        self.chat_open = False
+        self.unread = 0
         self.bubbles = []
-        self.heads_sig = None
-        self.controls_shown = True
-        self.last_beat = 0.0
-        self.local_path = None
+        self.faces_sig = None
+        self.card_sig = None
+        self.mini = False
+        self.touch = {}
+        self.last_tap = (0, 0, 0)
+        self.tap_seq = 0
+        self.speed = 1.0
 
         self.act = plugin.activity()
         if self.act is None:
             raise RuntimeError("нет активного окна")
         self.prev_orientation = self.act.getRequestedOrientation()
+        self.u = UI(self.act)
         self.build()
 
         L = listeners()
         self.dialog = Dialog(self.act, AR.style.Theme_Black_NoTitleBar_Fullscreen)
         self.dialog.setContentView(self.root)
         self.dialog.setCancelable(False)
-        self.dialog.setOnKeyListener(L["Keys"](lambda: self.p.run_safe(self.p.ask_close)))
-        self.dialog.setOnDismissListener(L["Dismissed"](lambda: self.p.run_safe(self.on_dismissed)))
+        self.dialog.setOnKeyListener(L["Keys"](lambda: self.p.run_safe(self.on_back)))
+        self.dialog.setOnDismissListener(L["Dismissed"](lambda d: self.p.run_safe(self.on_dismissed)))
         w = self.dialog.getWindow()
-        w.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        w.addFlags(0x80)        # FLAG_KEEP_SCREEN_ON
         w.setSoftInputMode(16)  # adjustResize
         self.dialog.show()
+        self.root.setAlpha(0.0)
+        self.root.animate().alpha(1.0).setDuration(220).start()
 
         self.load()
         run_on_ui_thread(self.tick, TICK_MS)
 
-    # ---------- построение интерфейса ----------
+    # ---------- свойства источника ----------
 
-    def build(self):
-        from android.widget import FrameLayout, LinearLayout, TextView, SeekBar, EditText, VideoView
-        from android.view import Gravity
-        from android.graphics import Color, Typeface
-        from android.graphics.drawable import GradientDrawable
-        from android.content.res import ColorStateList
-        from org.telegram.messenger import AndroidUtilities
+    @property
+    def prepared(self):
+        return self.media.prepared
 
-        self.FL, self.LL, self.TV = FrameLayout, LinearLayout, TextView
-        self.Gravity, self.Color, self.Typeface, self.GD = Gravity, Color, Typeface, GradientDrawable
-        dp = self.dp = lambda v: AndroidUtilities.dp(float(v))
-        ctx = self.act
-        host = self.p.is_host()
+    @property
+    def duration(self):
+        return self.media.duration
 
-        self.root = FrameLayout(ctx)
-        self.root.setBackgroundColor(Color.BLACK)
-        self.root.setOnClickListener(OnClickListener(lambda v: self.toggle_controls()))
-
-        # видео
-        self.vv = VideoView(ctx)
-        self.root.addView(self.vv, FrameLayout.LayoutParams(-1, -1, Gravity.CENTER))
-
-        # центр: загрузка, лобби, отсчёт
-        self.center = LinearLayout(ctx)
-        self.center.setOrientation(LinearLayout.VERTICAL)
-        self.center.setGravity(Gravity.CENTER)
-        self.big = self.text("", 44.0, True)
-        self.big.setGravity(Gravity.CENTER)
-        self.center.addView(self.big, LinearLayout.LayoutParams(-2, -2))
-        self.info = self.text("", 15.0)
-        self.info.setGravity(Gravity.CENTER)
-        self.info.setPadding(dp(24), dp(6), dp(24), dp(6))
-        self.center.addView(self.info, LinearLayout.LayoutParams(-2, -2))
-        self.start_btn = self.pill("▶  Начать для всех", ACCENT, lambda: self.p.host_start())
-        slp = LinearLayout.LayoutParams(-2, -2)
-        slp.topMargin = dp(16)
-        self.center.addView(self.start_btn, slp)
-        self.start_btn.setVisibility(8)
-        self.root.addView(self.center, FrameLayout.LayoutParams(-1, -2, Gravity.CENTER))
-
-        # верх: закрыть, заголовок, головы
-        self.top = LinearLayout(ctx)
-        self.top.setOrientation(LinearLayout.HORIZONTAL)
-        self.top.setGravity(Gravity.CENTER_VERTICAL)
-        self.top.setPadding(dp(8), dp(28), dp(12), dp(10))
-        self.top.setBackground(self.grad(True))
-        close = self.round_btn("✕", DARK, 40, lambda: self.p.ask_close(), 16.0)
-        self.top.addView(close, LinearLayout.LayoutParams(dp(40), dp(40)))
-        titles = LinearLayout(ctx)
-        titles.setOrientation(LinearLayout.VERTICAL)
-        self.title = self.text("Wtogether", 16.0, True)
-        self.title.setSingleLine(True)
-        self.subtitle = self.text("", 12.5)
-        self.subtitle.setSingleLine(True)
-        self.subtitle.setAlpha(0.8)
-        titles.addView(self.title)
-        titles.addView(self.subtitle)
-        tlp = LinearLayout.LayoutParams(0, -2, 1.0)
-        tlp.leftMargin = dp(10)
-        self.top.addView(titles, tlp)
-        self.faces = LinearLayout(ctx)
-        self.faces.setOrientation(LinearLayout.HORIZONTAL)
-        self.faces.setPadding(dp(4), dp(4), dp(4), dp(4))
-        self.faces.setBackground(self.shape(DARK, dp(20)))
-        self.faces.setOnClickListener(OnClickListener(lambda v: self.p.open_panel()))
-        self.top.addView(self.faces, LinearLayout.LayoutParams(-2, -2))
-        self.root.addView(self.top, FrameLayout.LayoutParams(-1, -2, Gravity.TOP))
-
-        # лента сообщений
-        self.feed = LinearLayout(ctx)
-        self.feed.setOrientation(LinearLayout.VERTICAL)
-        flp = FrameLayout.LayoutParams(dp(280), -2, Gravity.BOTTOM | Gravity.START)
-        flp.leftMargin = dp(12)
-        flp.bottomMargin = dp(212)
-        self.root.addView(self.feed, flp)
-
-        # низ: ползунок, кнопки, сообщение
-        self.bottom = LinearLayout(ctx)
-        self.bottom.setOrientation(LinearLayout.VERTICAL)
-        self.bottom.setPadding(dp(12), dp(16), dp(12), dp(14))
-        self.bottom.setBackground(self.grad(False))
-        self.bottom.setOnClickListener(OnClickListener(lambda v: None))  # не прячем по нажатию на панель
-
-        row = LinearLayout(ctx)
-        row.setOrientation(LinearLayout.HORIZONTAL)
-        row.setGravity(Gravity.CENTER_VERTICAL)
-        self.time_cur = self.text("0:00", 12.5, True)
-        row.addView(self.time_cur)
-        self.seek = SeekBar(ctx)
-        self.seek.setMax(1000)
-        try:
-            tint = ColorStateList.valueOf(Color.parseColor(ACCENT))
-            self.seek.setProgressTintList(tint)
-            self.seek.setThumbTintList(tint)
-        except Exception:
-            pass
-        L = listeners()
-        self.seek.setOnSeekBarChangeListener(L["Seek"](self.on_seek_change, self.on_seek_start, self.on_seek_stop))
-        self.seek.setEnabled(host)
-        row.addView(self.seek, LinearLayout.LayoutParams(0, -2, 1.0))
-        self.time_all = self.text("0:00", 12.5, True)
-        row.addView(self.time_all)
-        self.bottom.addView(row, LinearLayout.LayoutParams(-1, -2))
-
-        ctl = LinearLayout(ctx)
-        ctl.setOrientation(LinearLayout.HORIZONTAL)
-        ctl.setGravity(Gravity.CENTER)
-        p = self.p
-        self.btn_play = None
-        self.btn_speed = None
-        if host:
-            items = [("−10", DARK, lambda: p.host_skip(-SKIP_MS), 46, 15.0),
-                     ("▶", ACCENT, p.host_toggle, 58, 24.0),
-                     ("+10", DARK, lambda: p.host_skip(SKIP_MS), 46, 15.0),
-                     ("1×", DARK, p.host_speed, 46, 14.0)]
-        else:
-            items = [("🔄", DARK, p.catch_up, 48, 18.0)]
-        if host:
-            items += [("🔗", DARK, p.share_code, 46, 17.0)]
-        items += [("📞", DARK, p.start_call, 46, 17.0), ("⤢", DARK, self.rotate, 46, 17.0)]
-        for text, color, fn, size, ts in items:
-            b = self.round_btn(text, color, size, fn, ts)
-            if text == "▶":
-                self.btn_play = b
-            if text == "1×":
-                self.btn_speed = b
-            blp = LinearLayout.LayoutParams(dp(size), dp(size))
-            blp.leftMargin = dp(4)
-            blp.rightMargin = dp(4)
-            ctl.addView(b, blp)
-        clp = LinearLayout.LayoutParams(-1, -2)
-        clp.topMargin = dp(6)
-        self.bottom.addView(ctl, clp)
-
-        if not host:
-            self.lock = self.text("🔒 Управляет ведущий", 12.5)
-            self.lock.setGravity(Gravity.CENTER)
-            self.lock.setAlpha(0.75)
-            llp = LinearLayout.LayoutParams(-1, -2)
-            llp.topMargin = dp(6)
-            self.bottom.addView(self.lock, llp)
-
-        say = LinearLayout(ctx)
-        say.setOrientation(LinearLayout.HORIZONTAL)
-        say.setGravity(Gravity.CENTER_VERTICAL)
-        self.input = EditText(ctx)
-        self.input.setHint("Сообщение всем…")
-        self.input.setTextColor(Color.WHITE)
-        self.input.setHintTextColor(Color.parseColor("#99FFFFFF"))
-        self.input.setSingleLine(True)
-        self.input.setTextSize(15.0)
-        self.input.setPadding(dp(16), dp(10), dp(16), dp(10))
-        self.input.setBackground(self.shape("#33FFFFFF", dp(22)))
-        say.addView(self.input, LinearLayout.LayoutParams(0, -2, 1.0))
-        send = self.round_btn("➤", ACCENT, 44, self.send_input, 17.0)
-        sl = LinearLayout.LayoutParams(dp(44), dp(44))
-        sl.leftMargin = dp(8)
-        say.addView(send, sl)
-        sylp = LinearLayout.LayoutParams(-1, -2)
-        sylp.topMargin = dp(12)
-        self.bottom.addView(say, sylp)
-
-        self.root.addView(self.bottom, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
-
-        Prepared, Completed, Failed = L["Prepared"], L["Completed"], L["Failed"]
-        self.vv.setOnPreparedListener(Prepared(lambda mp: self.p.run_safe(lambda: self.on_prepared(mp))))
-        self.vv.setOnCompletionListener(Completed(lambda mp: self.p.run_safe(lambda: self.p.on_completed())))
-        self.vv.setOnErrorListener(Failed(lambda w, e: self.p.run_safe(lambda: self.on_error(w, e))))
-
-    def text(self, s, size=14.0, bold=False):
-        t = self.TV(self.act)
-        t.setText(s)
-        t.setTextColor(self.Color.WHITE)
-        t.setTextSize(size)
-        if bold:
-            t.setTypeface(self.Typeface.DEFAULT_BOLD)
-        return t
-
-    def shape(self, color, radius, oval=False):
-        d = self.GD()
-        d.setColor(self.Color.parseColor(color))
-        if oval:
-            d.setShape(self.GD.OVAL)
-        else:
-            d.setCornerRadius(float(radius))
-        return d
-
-    def grad(self, top):
-        from java import jarray, jint
-        colors = jarray(jint)([self.Color.parseColor("#D9000000"), self.Color.parseColor("#00000000")])
-        orient = self.GD.Orientation.TOP_BOTTOM if top else self.GD.Orientation.BOTTOM_TOP
-        return self.GD(orient, colors)
-
-    def round_btn(self, label, color, size, fn, ts=15.0):
-        b = self.text(label, ts, True)
-        b.setGravity(self.Gravity.CENTER)
-        b.setBackground(self.shape(color, 0, oval=True))
-        b.setOnClickListener(OnClickListener(lambda v: self.p.run_safe(fn)))
-        return b
-
-    def pill(self, label, color, fn):
-        dp = self.dp
-        b = self.text(label, 16.0, True)
-        b.setGravity(self.Gravity.CENTER)
-        b.setPadding(dp(24), dp(12), dp(24), dp(13))
-        b.setBackground(self.shape(color, dp(26)))
-        b.setOnClickListener(OnClickListener(lambda v: self.p.run_safe(fn)))
-        return b
-
-    def head(self, user, name, dot, crown):
-        dp = self.dp
-        box = self.FL(self.act)
-        box.setBackground(self.shape("#FFFFFF", 0, oval=True))
-        box.setPadding(dp(2), dp(2), dp(2), dp(2))
-        pic = None
-        try:
-            if user is not None:
-                from org.telegram.ui.Components import BackupImageView, AvatarDrawable
-                pic = BackupImageView(self.act)
-                pic.setRoundRadius(dp(15))
-                pic.setForUserOrChat(user, AvatarDrawable(user))
-        except Exception as e:
-            self.p.log_err(f"аватарка: {e}")
-            pic = None
-        if pic is None:
-            pic = self.text((name or "?")[:1].upper(), 14.0, True)
-            pic.setGravity(self.Gravity.CENTER)
-            pic.setBackground(self.shape(ACCENT, 0, oval=True))
-        box.addView(pic, self.FL.LayoutParams(-1, -1))
-        d = self.TV(self.act)
-        d.setBackground(self.shape(dot, 0, oval=True))
-        box.addView(d, self.FL.LayoutParams(dp(10), dp(10), self.Gravity.BOTTOM | self.Gravity.END))
-        if crown:
-            box.addView(self.text("👑", 10.0), self.FL.LayoutParams(-2, -2, self.Gravity.TOP | self.Gravity.END))
-        return box
-
-    # ---------- загрузка видео ----------
-
-    def load(self):
-        path = self.p.local_path(self.mo)
-        if path:
-            self.open_file(path)
-            return
-        self.big.setText("⏬")
-        self.info.setText("Загружаю видео…")
-        self.p.download(self.mo)
-        self.poll_download()
-
-    def poll_download(self):
-        if not self.alive:
-            return
-        path = self.p.local_path(self.mo)
-        if path:
-            self.open_file(path)
-            return
-        pc = self.p.download_percent(self.mo)
-        self.info.setText(f"Загружаю видео… {pc}%" if pc else "Загружаю видео…")
-        self.p.report_progress(pc)
-        run_on_ui_thread(self.poll_download, 500)
-
-    def open_file(self, path):
-        self.local_path = path
-        self.big.setText("")
-        self.info.setText("Готовлю плеер…")
-        self.vv.setVideoPath(path)
-
-    def on_prepared(self, mp):
-        self.mp = mp
-        self.prepared = True
-        self.duration = int(mp.getDuration())
-        self.time_all.setText(fmt_time(self.duration))
-        try:
-            mp.setLooping(False)
-        except Exception:
-            pass
-        self.vv.seekTo(0)
-        self.p.on_player_ready()
-
-    def on_error(self, what, extra):
-        self.p.log_err(f"плеер: ошибка {what}/{extra}")
-        self.big.setText("⚠️")
-        self.info.setText("Это видео не открывается на устройстве")
-
-    # ---------- управление ----------
+    @property
+    def fine_speed(self):
+        return self.media.fine_speed
 
     def position(self):
-        try:
-            return int(self.vv.getCurrentPosition()) if self.prepared else 0
-        except Exception:
-            return 0
+        return self.media.position()
 
     def playing(self):
-        try:
-            return bool(self.vv.isPlaying())
-        except Exception:
-            return False
+        return self.media.playing()
 
     def seek_to(self, ms):
         if not self.prepared:
             return
         ms = max(0, min(int(ms), max(0, self.duration - 300)))
-        try:
-            if self.mp is not None:
-                self.mp.seekTo(ms, 3)  # SEEK_CLOSEST — точно в нужный кадр
-            else:
-                self.vv.seekTo(ms)
-        except Exception:
-            self.vv.seekTo(ms)
+        self.media.seek_to(ms)
         self.seek_block_until = time.time() + SEEK_COOLDOWN
 
     def play(self):
         if self.prepared and not self.playing():
-            self.vv.start()
+            self.media.play()
 
     def pause(self):
         if self.prepared and self.playing():
-            self.vv.pause()
+            self.media.pause()
 
     def set_speed(self, x):
         x = round(float(x), 3)
-        if abs(x - self.speed) < 0.001 or self.mp is None or not self.playing():
+        if abs(x - self.speed) < 0.001 or not self.prepared or not self.playing():
             return
         try:
-            params = self.mp.getPlaybackParams()
-            params.setSpeed(x)
-            self.mp.setPlaybackParams(params)
+            self.media.set_speed(x)
             self.speed = x
         except Exception as e:
             self.p.log_err(f"скорость: {e}")
+
+    # ---------- построение ----------
+
+    def build(self):
+        u, dp = self.u, self.u.dp
+        FL, LL, G = u.FL, u.LL, u.Gravity
+        ctx = self.act
+        L = listeners()
+
+        self.root = FL(ctx)
+        self.root.setBackgroundColor(u.c("#FF000000"))
+
+        # видео
+        src = self.source.get("src")
+        self.media = YouTubeMedia(self, ctx) if src == "yt" else VideoMedia(self, ctx)
+        self.root.addView(self.media.view, FL.LayoutParams(-1, -1, G.CENTER))
+
+        # слой жестов
+        self.gestures = FL(ctx)
+        self.gestures.setOnTouchListener(L["Touch"](lambda v, e: self.p.run_safe(lambda: self.on_touch(e))))
+        self.root.addView(self.gestures, FL.LayoutParams(-1, -1))
+
+        # слой эффектов: реакции, подсказки жестов
+        self.fx = FL(ctx)
+        self.root.addView(self.fx, FL.LayoutParams(-1, -1))
+        self.hint = u.text("", 22.0, True)
+        self.hint.setGravity(G.CENTER)
+        self.hint.setPadding(dp(18), dp(10), dp(18), dp(10))
+        self.hint.setBackground(u.shape("#99000000", dp(20)))
+        self.hint.setAlpha(0.0)
+        self.fx.addView(self.hint, FL.LayoutParams(-2, -2, G.CENTER))
+
+        # центр: загрузка, лобби, ожидание, отсчёт, ошибка
+        self.card = LL(ctx)
+        self.card.setOrientation(LL.VERTICAL)
+        self.card.setGravity(G.CENTER_HORIZONTAL)
+        clp = FL.LayoutParams(-1, -2, G.CENTER)
+        clp.leftMargin = clp.rightMargin = dp(24)
+        self.root.addView(self.card, clp)
+        self.card.setVisibility(8)
+
+        # верхняя панель
+        self.top = LL(ctx)
+        self.top.setOrientation(LL.HORIZONTAL)
+        self.top.setGravity(G.CENTER_VERTICAL)
+        self.top.setPadding(dp(10), dp(30), dp(12), dp(18))
+        self.top.setBackground(u.grad(True))
+        self.top.addView(u.icon_button("close", "✕", 40, self.p.ask_close, "#33000000", 22), LL.LayoutParams(dp(40), dp(40)))
+        titles = LL(ctx)
+        titles.setOrientation(LL.VERTICAL)
+        self.title = u.text(self.source.get("title") or "Wtogether", 16.0, True)
+        self.title.setSingleLine(True)
+        self.title.setEllipsize(_ellipsize())
+        self.subtitle = u.text("", 12.5, False, "#B3FFFFFF")
+        self.subtitle.setSingleLine(True)
+        titles.addView(self.title)
+        titles.addView(self.subtitle)
+        tlp = LL.LayoutParams(0, -2, 1.0)
+        tlp.leftMargin = dp(10)
+        tlp.rightMargin = dp(8)
+        self.top.addView(titles, tlp)
+        self.faces = LL(ctx)
+        self.faces.setOrientation(LL.HORIZONTAL)
+        self.faces.setGravity(G.CENTER_VERTICAL)
+        self.faces.setPadding(dp(4), dp(4), dp(10), dp(4))
+        self.faces.setBackground(u.ripple(u.shape("#4D000000", dp(22)), radius=dp(22)))
+        self.faces.setClickable(True)
+        self.faces.setOnClickListener(OnClickListener(lambda v: self.p.run_safe(self.p.open_people)))
+        self.top.addView(self.faces, LL.LayoutParams(-2, dp(40)))
+        self.root.addView(self.top, FL.LayoutParams(-1, -2, G.TOP))
+
+        # плашка «управляет ведущий» / просьбы
+        self.banner = LL(ctx)
+        self.banner.setOrientation(LL.HORIZONTAL)
+        self.banner.setGravity(G.CENTER_VERTICAL)
+        self.banner.setPadding(dp(14), dp(8), dp(8), dp(8))
+        self.banner.setBackground(u.shape("#E61C1C1E", dp(20)))
+        self.banner.setVisibility(8)
+        blp = FL.LayoutParams(-2, -2, G.TOP | G.CENTER_HORIZONTAL)
+        blp.topMargin = dp(96)
+        self.root.addView(self.banner, blp)
+
+        # всплывающие сообщения (когда чат закрыт)
+        self.feed = LL(ctx)
+        self.feed.setOrientation(LL.VERTICAL)
+        flp = FL.LayoutParams(dp(280), -2, G.BOTTOM | G.START)
+        flp.leftMargin = dp(14)
+        flp.bottomMargin = dp(150)
+        self.root.addView(self.feed, flp)
+
+        # выбор реакции
+        self.react_bar = LL(ctx)
+        self.react_bar.setOrientation(LL.HORIZONTAL)
+        self.react_bar.setPadding(dp(6), dp(4), dp(6), dp(4))
+        self.react_bar.setBackground(u.shape("#F01C1C1E", dp(26)))
+        for e in REACTIONS:
+            b = u.text(e, 24.0)
+            b.setGravity(G.CENTER)
+            b.setBackground(u.ripple(u.shape("#00000000", oval=True), oval=True))
+            b.setClickable(True)
+            b.setOnClickListener(OnClickListener(lambda v, e=e: self.p.run_safe(lambda: self.p.send_reaction(e))))
+            self.react_bar.addView(b, LL.LayoutParams(dp(42), dp(44)))
+        rlp = FL.LayoutParams(-2, -2, G.BOTTOM | G.CENTER_HORIZONTAL)
+        rlp.bottomMargin = dp(140)
+        self.root.addView(self.react_bar, rlp)
+        self.react_bar.setVisibility(8)
+
+        # чат сбоку, как в стримах
+        self.build_chat()
+
+        # нижняя «пилюля»
+        self.bottom = LL(ctx)
+        self.bottom.setOrientation(LL.VERTICAL)
+        self.bottom.setPadding(dp(14), dp(8), dp(10), dp(8))
+        self.bottom.setBackground(u.shape("#E61C1C1E", dp(28)))
+        self.bottom.setClickable(True)
+        row = LL(ctx)
+        row.setOrientation(LL.HORIZONTAL)
+        row.setGravity(G.CENTER_VERTICAL)
+        self.time_cur = u.text("0:00", 12.0, True)
+        row.addView(self.time_cur)
+        from android.widget import SeekBar
+        self.seek = SeekBar(ctx)
+        self.seek.setMax(1000)
+        try:
+            tint = u.CSL.valueOf(u.c(u.accent))
+            self.seek.setProgressTintList(tint)
+            self.seek.setThumbTintList(tint)
+            self.seek.setProgressBackgroundTintList(u.CSL.valueOf(u.c("#4DFFFFFF")))
+        except Exception:
+            pass
+        self.seek.setOnSeekBarChangeListener(L["Seek"](self.on_seek_change, self.on_seek_start, self.on_seek_stop))
+        row.addView(self.seek, LL.LayoutParams(0, dp(32), 1.0))
+        self.time_all = u.text("0:00", 12.0, True, "#B3FFFFFF")
+        row.addView(self.time_all)
+        self.bottom.addView(row, LL.LayoutParams(-1, -2))
+        self.controls = LL(ctx)
+        self.controls.setOrientation(LL.HORIZONTAL)
+        self.controls.setGravity(G.CENTER_VERTICAL)
+        self.bottom.addView(self.controls, LL.LayoutParams(-1, dp(52)))
+        blp2 = FL.LayoutParams(-1, -2, G.BOTTOM)
+        blp2.leftMargin = blp2.rightMargin = dp(12)
+        blp2.bottomMargin = dp(16)
+        self.root.addView(self.bottom, blp2)
+        self.rebuild_controls()
+
+        # громкость/яркость
+        self.side = LL(ctx)
+        self.side.setOrientation(LL.VERTICAL)
+        self.side.setGravity(G.CENTER_HORIZONTAL)
+        self.side.setPadding(dp(10), dp(12), dp(10), dp(12))
+        self.side.setBackground(u.shape("#B31C1C1E", dp(22)))
+        self.side_icon = FL(ctx)
+        self.side.addView(self.side_icon, LL.LayoutParams(dp(24), dp(24)))
+        self.side_text = u.text("", 13.0, True)
+        self.side_text.setGravity(G.CENTER)
+        self.side.addView(self.side_text, LL.LayoutParams(-2, -2))
+        self.root.addView(self.side, FL.LayoutParams(-2, -2, G.CENTER))
+        self.side.setAlpha(0.0)
+
+        # кнопки мини-плеера
+        self.mini_bar = LL(ctx)
+        self.mini_bar.setOrientation(LL.HORIZONTAL)
+        self.mini_bar.addView(u.icon_button("expand", "⤢", 34, self.exit_mini, "#99000000", 18), LL.LayoutParams(dp(34), dp(34)))
+        sp = LL.LayoutParams(0, 1, 1.0)
+        self.mini_bar.addView(u.TV(ctx), sp)
+        self.mini_bar.addView(u.icon_button("close", "✕", 34, self.p.ask_close, "#99000000", 18), LL.LayoutParams(dp(34), dp(34)))
+        mlp = FL.LayoutParams(-1, -2, G.TOP)
+        mlp.leftMargin = mlp.rightMargin = mlp.topMargin = dp(6)
+        self.root.addView(self.mini_bar, mlp)
+        self.mini_bar.setVisibility(8)
+
+    def build_chat(self):
+        u, dp = self.u, self.u.dp
+        FL, LL, G = u.FL, u.LL, u.Gravity
+        ctx = self.act
+        from android.widget import ScrollView, EditText
+        self.chat = LL(ctx)
+        self.chat.setOrientation(LL.VERTICAL)
+        self.chat.setPadding(dp(12), dp(10), dp(10), dp(10))
+        self.chat.setBackground(u.shape("#D91C1C1E", dp(22)))
+        self.chat.setClickable(True)
+        head = LL(ctx)
+        head.setOrientation(LL.HORIZONTAL)
+        head.setGravity(G.CENTER_VERTICAL)
+        head.addView(u.text("Чат", 15.0, True), LL.LayoutParams(0, -2, 1.0))
+        head.addView(u.icon_button("close", "✕", 30, self.toggle_chat, "#00000000", 18), LL.LayoutParams(dp(30), dp(30)))
+        self.chat.addView(head, LL.LayoutParams(-1, -2))
+        self.chat_scroll = ScrollView(ctx)
+        self.chat_list = LL(ctx)
+        self.chat_list.setOrientation(LL.VERTICAL)
+        self.chat_scroll.addView(self.chat_list)
+        self.chat.addView(self.chat_scroll, LL.LayoutParams(-1, 0, 1.0))
+        say = LL(ctx)
+        say.setOrientation(LL.HORIZONTAL)
+        say.setGravity(G.CENTER_VERTICAL)
+        self.input = EditText(ctx)
+        self.input.setHint("Сообщение")
+        self.input.setTextColor(u.c("#FFFFFFFF"))
+        self.input.setHintTextColor(u.c("#80FFFFFF"))
+        self.input.setTextSize(14.0)
+        self.input.setSingleLine(True)
+        self.input.setPadding(dp(14), dp(8), dp(14), dp(8))
+        self.input.setBackground(u.shape("#26FFFFFF", dp(18)))
+        say.addView(self.input, LL.LayoutParams(0, -2, 1.0))
+        slp = LL.LayoutParams(dp(38), dp(38))
+        slp.leftMargin = dp(6)
+        say.addView(u.icon_button("send", "➤", 38, self.send_input, u.accent, 20), slp)
+        sylp = LL.LayoutParams(-1, -2)
+        sylp.topMargin = dp(8)
+        self.chat.addView(say, sylp)
+        clp = FL.LayoutParams(dp(300), -1, G.END)
+        clp.topMargin = dp(88)
+        clp.bottomMargin = dp(140)
+        clp.rightMargin = dp(10)
+        self.root.addView(self.chat, clp)
+        self.chat.setVisibility(8)
+
+    def rebuild_controls(self):
+        """Кнопки зависят от роли — пересобираем при передаче управления."""
+        u, dp = self.u, self.u.dp
+        LL = u.LL
+        p = self.p
+        host = p.is_host()
+        c = self.controls
+        c.removeAllViews()
+        self.btn_play = None
+        self.btn_speed = None
+
+        def add(view, size, gap=4):
+            lp = LL.LayoutParams(dp(size), dp(size))
+            lp.leftMargin = lp.rightMargin = dp(gap)
+            c.addView(view, lp)
+
+        if host:
+            add(u.seek_button(True, lambda: p.run_safe(lambda: p.host_skip(-SKIP_MS))), 44)
+            self.btn_play = u.icon_button("play", "▶", 52, lambda: p.run_safe(p.host_toggle), u.accent, 28)
+            add(self.btn_play, 52)
+            add(u.seek_button(False, lambda: p.run_safe(lambda: p.host_skip(SKIP_MS))), 44)
+        else:
+            add(u.icon_button("hand", "✋", 44, lambda: p.run_safe(p.ask_wait), "#26FFFFFF", 22), 44)
+            add(u.icon_button("retry", "⟳", 44, lambda: p.run_safe(p.catch_up), "#26FFFFFF", 22), 44)
+        c.addView(u.TV(self.act), LL.LayoutParams(0, 1, 1.0))
+        if host:
+            self.btn_speed = u.text("1×", 14.0, True)
+            self.btn_speed.setGravity(u.Gravity.CENTER)
+            self.btn_speed.setBackground(u.ripple(u.shape("#26FFFFFF", oval=True), oval=True))
+            self.btn_speed.setClickable(True)
+            self.btn_speed.setOnClickListener(OnClickListener(lambda v: p.run_safe(p.host_speed)))
+            add(self.btn_speed, 40, 3)
+        add(u.icon_button("react", "😊", 40, self.toggle_reactions, "#26FFFFFF", 22), 40, 3)
+        self.btn_chat = u.icon_button("chat", "💬", 40, self.toggle_chat, "#26FFFFFF", 22, badge=True)
+        self.chat_badge = u.last_badge
+        add(self.btn_chat, 40, 3)
+        add(u.icon_button("more", "⋯", 40, lambda: p.run_safe(p.open_more), "#26FFFFFF", 22), 40, 3)
+        try:
+            self.seek.setEnabled(host)
+            self.seek.setAlpha(1.0 if host else 0.6)
+        except Exception:
+            pass
+
+    # ---------- загрузка ----------
+
+    def load(self):
+        src = self.source.get("src")
+        if src == "yt":
+            self.show_card("loading", text="Открываю YouTube…")
+            self.media.open(self.source["yt"])
+        elif src == "url":
+            self.show_card("loading", text="Открываю видео по ссылке…")
+            self.media.open(self.source["url"])
+        else:
+            mo = self.source["mo"]
+            path = self.p.local_path(mo)
+            if path:
+                self.open_file(path)
+            else:
+                self.show_card("loading", text="Загружаю видео…", pc=0)
+                self.p.download(mo)
+                self.poll_download()
+
+    def poll_download(self):
+        if not self.alive:
+            return
+        mo = self.source["mo"]
+        path = self.p.local_path(mo)
+        if path:
+            self.open_file(path)
+            return
+        pc = self.p.download_percent(mo)
+        self.show_card("loading", text=f"Загружаю видео… {pc}%" if pc else "Загружаю видео…", pc=pc)
+        self.p.report_progress(pc)
+        run_on_ui_thread(self.poll_download, 500)
+
+    def open_file(self, path):
+        self.show_card("loading", text="Готовлю плеер…")
+        self.media.open(path)
+
+    def on_prepared(self):
+        self.time_all.setText(fmt_time(self.duration))
+        self.card_sig = None
+        self.p.on_player_ready()
+
+    def on_error(self, text):
+        self.p.log_err(f"плеер: {text}")
+        self.show_card("error", text=text)
+
+    # ---------- центральная карточка ----------
+
+    def show_card(self, kind, text="", pc=None, rows=None, big=None, action=None, people=None):
+        """kind: loading / lobby / waiting / countdown / error / none."""
+        sig = (kind, text, pc, tuple(rows or ()), big, bool(action))
+        if sig == self.card_sig:
+            return
+        u, dp = self.u, self.u.dp
+        LL, G = u.LL, u.Gravity
+        prev_kind = self.card_sig[0] if self.card_sig else None
+        self.card_sig = sig
+        c = self.card
+        c.removeAllViews()
+        if kind == "none":
+            c.setVisibility(8)
+            return
+        c.setVisibility(0)
+        if kind == "countdown":
+            c.setBackground(None)
+            n = u.text(str(big), 96.0, True)
+            n.setGravity(G.CENTER)
+            n.setShadowLayer(dp(8), 0.0, 0.0, u.c("#99000000"))
+            c.addView(n, LL.LayoutParams(-2, -2))
+            c.addView(self.centered(text, 15.0, "#E6FFFFFF"), LL.LayoutParams(-2, -2))
+            n.setScaleX(1.6)
+            n.setScaleY(1.6)
+            n.setAlpha(0.0)
+            n.animate().scaleX(1.0).scaleY(1.0).alpha(1.0).setDuration(350).start()
+            return
+        c.setBackground(u.shape("#F01C1C1E", dp(24)))
+        c.setPadding(dp(20), dp(20), dp(20), dp(20))
+        if kind == "loading":
+            c.addView(self.centered(text, 16.0, "#FFFFFFFF", True), LL.LayoutParams(-1, -2))
+            if pc is not None:
+                c.addView(self.progress(pc), self.lp_top(-1, dp(6), 14))
+        elif kind == "error":
+            c.addView(self.centered("⚠️", 34.0), LL.LayoutParams(-1, -2))
+            c.addView(self.centered(text, 15.0, "#FFFFFFFF"), self.lp_top(-1, -2, 8))
+        elif kind == "waiting":
+            if people:
+                c.addView(u.avatar(people[0], people[1], 56, crown=True), LL.LayoutParams(dp(56), dp(56)))
+            c.addView(self.centered(text, 16.0, "#FFFFFFFF", True), self.lp_top(-1, -2, 10))
+            if big:
+                c.addView(self.centered(big, 13.0, "#99FFFFFF"), self.lp_top(-1, -2, 4))
+        elif kind == "lobby":
+            c.setGravity(G.START)
+            c.addView(u.text(f"Комната {big}", 20.0, True), LL.LayoutParams(-2, -2))
+            c.addView(u.text("Позови друзей — у всех один код", 13.0, False, "#99FFFFFF"), self.lp_top(-2, -2, 2))
+            btns = LL(self.act)
+            btns.setOrientation(LL.HORIZONTAL)
+            btns.addView(u.pill_button("Код", lambda: self.p.run_safe(self.p.copy_code), "#33FFFFFF", "copy", 14.0))
+            gap = LL.LayoutParams(-2, -2)
+            gap.leftMargin = dp(8)
+            btns.addView(u.pill_button("Пригласить", lambda: self.p.run_safe(self.p.share_code), "#33FFFFFF", "share", 14.0), gap)
+            c.addView(btns, self.lp_top(-2, -2, 12))
+            for user, name, status, frac, dot in rows or []:
+                c.addView(self.member_row(user, name, status, frac, dot), self.lp_top(-1, -2, 12))
+            if not rows:
+                c.addView(u.text("Пока никого. Отправь код другу.", 14.0, False, "#B3FFFFFF"), self.lp_top(-2, -2, 14))
+            start = u.pill_button("Начать для всех", lambda: self.p.run_safe(self.p.host_start), u.accent, "play", 16.0)
+            c.addView(start, self.lp_top(-1, -2, 18))
+        c.setGravity(G.CENTER_HORIZONTAL if kind != "lobby" else G.START)
+        if prev_kind != kind:
+            c.setAlpha(0.0)
+            c.setTranslationY(float(dp(12)))
+            c.animate().alpha(1.0).translationY(0.0).setDuration(220).start()
+
+    def centered(self, s, size, color="#FFFFFFFF", bold=False):
+        t = self.u.text(s, size, bold, color)
+        t.setGravity(self.u.Gravity.CENTER)
+        return t
+
+    def lp_top(self, w, h, top):
+        lp = self.u.LL.LayoutParams(w, h)
+        lp.topMargin = self.u.dp(top)
+        return lp
+
+    def progress(self, pc):
+        u, dp = self.u, self.u.dp
+        bar = u.FL(self.act)
+        bar.setBackground(u.shape("#33FFFFFF", dp(3)))
+        fill = u.TV(self.act)
+        fill.setBackground(u.shape(u.accent, dp(3)))
+        bar.addView(fill, u.FL.LayoutParams(0, -1))
+        bar.post(R(lambda: fill.setLayoutParams(u.FL.LayoutParams(int(bar.getWidth() * max(0, min(100, pc)) / 100), -1))))
+        return bar
+
+    def member_row(self, user, name, status, frac, dot):
+        u, dp = self.u, self.u.dp
+        LL = u.LL
+        row = LL(self.act)
+        row.setOrientation(LL.HORIZONTAL)
+        row.setGravity(u.Gravity.CENTER_VERTICAL)
+        row.addView(u.avatar(user, name, 38, dot=dot), LL.LayoutParams(dp(40), dp(40)))
+        col = LL(self.act)
+        col.setOrientation(LL.VERTICAL)
+        col.addView(u.text(name, 15.0, True))
+        col.addView(u.text(status, 12.5, False, "#99FFFFFF"))
+        if frac is not None:
+            col.addView(self.progress(int(frac)), self.lp_top(-1, dp(3), 4))
+        clp = LL.LayoutParams(0, -2, 1.0)
+        clp.leftMargin = dp(12)
+        row.addView(col, clp)
+        return row
+
+    # ---------- верх ----------
+
+    def set_titles(self, title, subtitle):
+        self.subtitle.setText(subtitle)
+        if title:
+            self.title.setText(title)
+
+    def refresh_faces(self, people):
+        sig = tuple((n, d, cr) for _, n, d, cr in people)
+        if sig == self.faces_sig:
+            return
+        self.faces_sig = sig
+        u, dp = self.u, self.u.dp
+        self.faces.removeAllViews()
+        for i, (user, name, dot, crown) in enumerate(people[:5]):
+            lp = u.LL.LayoutParams(dp(32), dp(32))
+            if i:
+                lp.leftMargin = -dp(8)
+            self.faces.addView(u.avatar(user, name, 30, dot=dot, crown=crown), lp)
+        n = len(people)
+        cnt = u.text(f"{n}" if n <= 5 else f"+{n - 5}", 13.0, True)
+        clp = u.LL.LayoutParams(-2, -2)
+        clp.leftMargin = dp(6)
+        self.faces.addView(cnt, clp)
+
+    def show_banner(self, text, action=None, fn=None, seconds=6):
+        u, dp = self.u, self.u.dp
+        b = self.banner
+        b.removeAllViews()
+        b.addView(u.text(text, 14.0, True))
+        if action:
+            btn = u.text(action, 13.0, True)
+            btn.setPadding(dp(12), dp(6), dp(12), dp(6))
+            btn.setBackground(u.ripple(u.shape(u.accent, dp(14)), radius=dp(14)))
+            btn.setClickable(True)
+            btn.setOnClickListener(OnClickListener(lambda v: (self.hide_banner(), self.p.run_safe(fn))))
+            lp = u.LL.LayoutParams(-2, -2)
+            lp.leftMargin = dp(10)
+            b.addView(btn, lp)
+        else:
+            b.setPadding(dp(14), dp(9), dp(14), dp(9))
+        b.setVisibility(0)
+        b.setAlpha(0.0)
+        b.setTranslationY(float(-dp(10)))
+        b.animate().alpha(1.0).translationY(0.0).setDuration(200).start()
+        self.banner_id = getattr(self, "banner_id", 0) + 1
+        bid = self.banner_id
+        run_on_ui_thread(lambda: self.hide_banner() if self.banner_id == bid else None, seconds * 1000)
+
+    def hide_banner(self):
+        self.banner.animate().alpha(0.0).setDuration(200).start()
+        run_on_ui_thread(lambda: self.banner.setVisibility(8), 210)
+
+    # ---------- цикл ----------
+
+    def tick(self):
+        if not self.alive:
+            return
+        try:
+            self.media.poll()
+            self.p.on_tick(self)
+            if self.prepared and not self.dragging:
+                pos = self.position()
+                self.time_cur.setText(fmt_time(pos))
+                if self.duration:
+                    self.seek.setProgress(int(pos * 1000 / self.duration))
+            if self.btn_play is not None:
+                playing = self.playing()
+                if getattr(self, "_shown_playing", None) != playing:
+                    self._shown_playing = playing
+                    self.swap_icon(self.btn_play, "pause" if playing else "play", "⏸" if playing else "▶")
+            self.refresh_faces(self.p.lobby_people())
+        except Exception as e:
+            self.p.log_err(f"tick: {e}")
+        run_on_ui_thread(self.tick, TICK_MS)
+
+    def swap_icon(self, button, key, fallback):
+        u = self.u
+        old = button.getTag()
+        if old is not None:
+            button.removeView(old)
+        ic = u.icon(key, fallback, 28)
+        button.addView(ic, u.FL.LayoutParams(u.dp(28), u.dp(28), u.Gravity.CENTER))
+        button.setTag(ic)
+
+    def set_speed_label(self, x):
+        if self.btn_speed is not None:
+            self.btn_speed.setText(f"{x:g}×")
 
     # ---------- ползунок ----------
 
@@ -1027,76 +1786,199 @@ class Player:
         if self.p.is_host() and self.duration:
             self.p.host_seek(int(self.duration * progress / 1000))
 
-    # ---------- цикл ----------
+    # ---------- жесты ----------
 
-    def tick(self):
-        if not self.alive:
+    def on_touch(self, e):
+        if self.mini:
+            return self.mini_touch(e)
+        act = e.getActionMasked()
+        x, y, now = float(e.getX()), float(e.getY()), time.time()
+        w = max(1, self.gestures.getWidth())
+        h = max(1, self.gestures.getHeight())
+        t = self.touch
+        if act == 0:  # DOWN
+            self.touch = {"x": x, "y": y, "t": now, "mode": None, "pos": self.position(),
+                          "vol": self.volume(), "br": self.brightness()}
+            return True
+        if not t:
+            return True
+        dx, dy = x - t["x"], y - t["y"]
+        if act == 2:  # MOVE
+            if t["mode"] is None and (abs(dx) > self.u.dp(16) or abs(dy) > self.u.dp(16)):
+                if not self.p.get_setting("gestures", True):
+                    t["mode"] = "none"
+                elif abs(dx) > abs(dy):
+                    t["mode"] = "seek" if self.p.is_host() and self.prepared else "locked"
+                else:
+                    t["mode"] = "vol" if t["x"] > w / 2 else "br"
+            m = t["mode"]
+            if m == "seek":
+                delta = int(dx / w * min(self.duration, 180000))
+                target = max(0, min(self.duration, t["pos"] + delta))
+                t["target"] = target
+                self.flash(f"{fmt_time(target)}  ({'+' if delta >= 0 else '−'}{abs(delta) // 1000} с)", keep=True)
+            elif m == "vol":
+                self.set_volume(t["vol"] - dy / h * 1.4)
+            elif m == "br":
+                self.set_brightness(t["br"] - dy / h * 1.4)
+            return True
+        if act in (1, 3):  # UP / CANCEL
+            m = t.get("mode")
+            self.touch = {}
+            if m == "seek" and "target" in t:
+                self.hide_flash()
+                self.p.host_seek(t["target"])
+            elif m == "locked":
+                self.locked_hint()
+            elif m in ("vol", "br"):
+                self.side.animate().alpha(0.0).setDuration(400).start()
+            elif m is None and act == 1:
+                self.on_tap(x, w, now)
+        return True
+
+    def on_tap(self, x, w, now):
+        lx, lt, _ = self.last_tap
+        if now - lt < 0.3 and abs(x - lx) < self.u.dp(60) and self.p.get_setting("gestures", True):
+            self.last_tap = (0, 0, 0)
+            self.tap_seq += 1
+            third = x / w
+            if not self.p.is_host():
+                self.locked_hint()
+            elif third < 0.33:
+                self.p.host_skip(-SKIP_MS)
+                self.flash("⟲  −10 с")
+            elif third > 0.66:
+                self.p.host_skip(SKIP_MS)
+                self.flash("+10 с  ⟳")
+            else:
+                self.p.host_toggle()
             return
+        self.last_tap = (x, now, 0)
+        self.tap_seq += 1
+        seq = self.tap_seq
+        run_on_ui_thread(lambda: self.toggle_ui() if self.tap_seq == seq else None, 310)
+
+    def locked_hint(self):
+        self.flash(f"🔒 Управляет {self.p.host_name()}")
+
+    def flash(self, text, keep=False):
+        self.hint.setText(text)
+        self.hint.animate().cancel()
+        self.hint.setAlpha(1.0)
+        if not keep:
+            self.hint.animate().alpha(0.0).setStartDelay(700).setDuration(300).start()
+
+    def hide_flash(self):
+        self.hint.animate().alpha(0.0).setStartDelay(150).setDuration(250).start()
+
+    def audio(self):
+        return self.act.getSystemService("audio")
+
+    def volume(self):
         try:
-            self.p.on_tick(self)
-            if self.prepared and not self.dragging:
-                pos = self.position()
-                self.time_cur.setText(fmt_time(pos))
-                if self.duration:
-                    self.seek.setProgress(int(pos * 1000 / self.duration))
-            if self.btn_play is not None:
-                self.btn_play.setText("⏸" if self.playing() else "▶")
-            self.refresh_faces()
+            a = self.audio()
+            return a.getStreamVolume(3) / max(1, a.getStreamMaxVolume(3))
+        except Exception:
+            return 0.5
+
+    def set_volume(self, f):
+        f = max(0.0, min(1.0, f))
+        try:
+            a = self.audio()
+            a.setStreamVolume(3, int(round(f * a.getStreamMaxVolume(3))), 0)
         except Exception as e:
-            self.p.log_err(f"tick: {e}")
-        run_on_ui_thread(self.tick, TICK_MS)
+            self.p.log_err(f"громкость: {e}")
+        self.show_side("volume", "🔊", f)
 
-    def refresh_faces(self):
-        people = self.p.lobby_people()
-        sig = tuple((n, c, cr) for _, n, c, cr in people)
-        if sig == self.heads_sig:
-            return
-        self.heads_sig = sig
-        dp = self.dp
-        self.faces.removeAllViews()
-        for i, (user, name, dot, crown) in enumerate(people[:6]):
-            lp = self.LL.LayoutParams(dp(32), dp(32))
-            if i:
-                lp.leftMargin = -dp(8)
-            self.faces.addView(self.head(user, name, dot, crown), lp)
-        if len(people) > 6:
-            more = self.text(f"+{len(people) - 6}", 12.0, True)
-            ml = self.LL.LayoutParams(-2, -2)
-            ml.leftMargin = dp(4)
-            self.faces.addView(more, ml)
+    def brightness(self):
+        try:
+            b = float(self.dialog.getWindow().getAttributes().screenBrightness)
+            return b if b >= 0 else 0.5
+        except Exception:
+            return 0.5
 
-    def set_state(self, big, info, show_start=False):
-        self.big.setText(big or "")
-        self.info.setText(info or "")
-        self.center.setVisibility(0 if (big or info or show_start) else 8)
-        self.start_btn.setVisibility(0 if show_start else 8)
+    def set_brightness(self, f):
+        f = max(0.02, min(1.0, f))
+        try:
+            w = self.dialog.getWindow()
+            lp = w.getAttributes()
+            lp.screenBrightness = float(f)
+            w.setAttributes(lp)
+        except Exception as e:
+            self.p.log_err(f"яркость: {e}")
+        self.show_side("bright", "☀️", f)
 
-    def set_titles(self, title, subtitle):
-        self.title.setText(title)
-        self.subtitle.setText(subtitle)
+    def show_side(self, key, fallback, f):
+        u = self.u
+        if getattr(self, "_side_key", None) != key:
+            self._side_key = key
+            self.side_icon.removeAllViews()
+            self.side_icon.addView(u.icon(key, fallback, 24), u.FL.LayoutParams(-1, -1))
+        self.side_text.setText(f"{int(f * 100)}%")
+        self.side.animate().cancel()
+        self.side.setAlpha(1.0)
 
-    def toggle_controls(self):
-        self.controls_shown = not self.controls_shown
-        a = 1.0 if self.controls_shown else 0.0
+    # ---------- показ и скрытие панелей ----------
+
+    def toggle_ui(self):
+        self.ui_shown = not self.ui_shown
+        a = 1.0 if self.ui_shown else 0.0
         for v in (self.top, self.bottom):
             v.setVisibility(0)
             v.animate().alpha(a).setDuration(200).start()
+        if not self.ui_shown:
+            self.react_bar.setVisibility(8)
 
-        def hide():
-            if not self.controls_shown:
-                self.top.setVisibility(4)
-                self.bottom.setVisibility(4)
-        if not self.controls_shown:
+            def hide():
+                if not self.ui_shown:
+                    self.top.setVisibility(4)
+                    self.bottom.setVisibility(4)
             run_on_ui_thread(hide, 220)
 
-    def rotate(self):
-        try:
-            cur = self.act.getRequestedOrientation()
-            self.act.setRequestedOrientation(-1 if cur == 6 else 6)  # SENSOR_LANDSCAPE ↔ как было
-        except Exception as e:
-            self.p.log_err(f"поворот: {e}")
+    def toggle_reactions(self):
+        rb = self.react_bar
+        if rb.getVisibility() == 0:
+            rb.setVisibility(8)
+            return
+        rb.setVisibility(0)
+        rb.setScaleX(0.8)
+        rb.setScaleY(0.8)
+        rb.setAlpha(0.0)
+        rb.animate().scaleX(1.0).scaleY(1.0).alpha(1.0).setDuration(180).start()
 
-    # ---------- сообщения ----------
+    def toggle_chat(self):
+        self.chat_open = not self.chat_open
+        ch = self.chat
+        if self.chat_open:
+            ch.setVisibility(0)
+            ch.setTranslationX(float(self.u.dp(40)))
+            ch.setAlpha(0.0)
+            ch.animate().translationX(0.0).alpha(1.0).setDuration(220).start()
+            self.feed.setVisibility(8)
+            self.unread = 0
+            self.update_badge()
+            self.chat_scroll.post(R(lambda: self.chat_scroll.fullScroll(130)))
+        else:
+            ch.animate().translationX(float(self.u.dp(40))).alpha(0.0).setDuration(180).start()
+            run_on_ui_thread(lambda: ch.setVisibility(8) if not self.chat_open else None, 190)
+            self.feed.setVisibility(0)
+            try:
+                from org.telegram.messenger import AndroidUtilities
+                AndroidUtilities.hideKeyboard(self.input)
+            except Exception:
+                pass
+
+    def update_badge(self):
+        b = getattr(self, "chat_badge", None)
+        if b is None:
+            return
+        if self.unread:
+            b.setText(str(min(self.unread, 99)))
+            b.setVisibility(0)
+        else:
+            b.setVisibility(8)
+
+    # ---------- сообщения и реакции ----------
 
     def send_input(self):
         t = str(self.input.getText()).strip()
@@ -1104,39 +1986,176 @@ class Player:
             self.input.setText("")
             self.p.say_all(t)
 
-    def bubble(self, who, text, mine=False):
+    def add_message(self, who, text, mine=False, at=None):
         if not self.alive:
             return
-        dp = self.dp
-        t = self.text(f"{who}: {text}", 14.0)
+        u, dp = self.u, self.u.dp
+        line = u.LL(self.act)
+        line.setOrientation(u.LL.VERTICAL)
+        line.setPadding(0, dp(4), 0, dp(4))
+        hue = u.accent if mine else ["#FF7AB8FF", "#FFFF9F7A", "#FF7ADB9A", "#FFD39AFF", "#FFFFD27A"][sum(map(ord, who)) % 5]
+        head = u.text(who + (f"  ·  {fmt_time(at)}" if at is not None else ""), 12.5, True, hue)
+        line.addView(head)
+        line.addView(u.text(text, 14.5))
+        self.chat_list.addView(line)
+        while self.chat_list.getChildCount() > 200:
+            self.chat_list.removeViewAt(0)
+        if self.chat_open:
+            self.chat_scroll.post(R(lambda: self.chat_scroll.fullScroll(130)))
+        else:
+            if not mine:
+                self.unread += 1
+                self.update_badge()
+            self.bubble(who, text, mine)
+
+    def bubble(self, who, text, mine=False):
+        if not self.alive or self.chat_open:
+            return
+        u, dp = self.u, self.u.dp
+        t = u.text(f"{who}: {text}", 14.0)
         t.setPadding(dp(12), dp(7), dp(12), dp(8))
-        t.setBackground(self.shape(ACCENT if mine else PANEL, dp(16)))
-        lp = self.LL.LayoutParams(-2, -2)
+        t.setBackground(u.shape(u.accent if mine else "#D91C1C1E", dp(16)))
+        lp = u.LL.LayoutParams(-2, -2)
         lp.topMargin = dp(6)
         self.feed.addView(t, lp)
+        t.setAlpha(0.0)
+        t.setTranslationX(float(-dp(20)))
+        t.animate().alpha(1.0).translationX(0.0).setDuration(200).start()
         self.bubbles.append(t)
         while len(self.bubbles) > 4:
             self.feed.removeView(self.bubbles.pop(0))
 
         def fade():
             if t in self.bubbles:
-                self.bubbles.remove(t)
-                try:
-                    self.feed.removeView(t)
-                except Exception:
-                    pass
-        run_on_ui_thread(fade, 8000)
+                t.animate().alpha(0.0).setDuration(300).start()
+                run_on_ui_thread(lambda: (t in self.bubbles) and (self.bubbles.remove(t), self.feed.removeView(t)), 320)
+        run_on_ui_thread(fade, 7000)
+
+    def fly(self, emoji, who):
+        """Реакция вылетает снизу справа и тает."""
+        if not self.alive:
+            return
+        u, dp = self.u, self.u.dp
+        box = u.LL(self.act)
+        box.setOrientation(u.LL.VERTICAL)
+        box.setGravity(u.Gravity.CENTER_HORIZONTAL)
+        box.addView(u.text(emoji, 34.0))
+        if who:
+            n = u.text(who, 11.0, True)
+            n.setShadowLayer(dp(3), 0.0, 0.0, u.c("#CC000000"))
+            box.addView(n)
+        lp = u.FL.LayoutParams(-2, -2, u.Gravity.BOTTOM | u.Gravity.END)
+        lp.rightMargin = dp(24 + random.randint(0, 70))
+        lp.bottomMargin = dp(150)
+        self.fx.addView(box, lp)
+        box.setScaleX(0.4)
+        box.setScaleY(0.4)
+        box.animate().translationY(float(-dp(320 + random.randint(0, 80)))) \
+            .translationX(float(dp(random.randint(-40, 40)))).scaleX(1.25).scaleY(1.25).alpha(0.0) \
+            .setDuration(2600).start()
+        run_on_ui_thread(lambda: self.fx.removeView(box), 2700)
+
+    # ---------- мини-плеер ----------
+
+    def enter_mini(self):
+        if self.mini:
+            return
+        u, dp = self.u, self.u.dp
+        self.mini = True
+        for v in (self.top, self.bottom, self.card, self.chat, self.feed, self.react_bar, self.banner):
+            v.setVisibility(8)
+        self.mini_bar.setVisibility(0)
+        try:
+            from android.view import ViewOutlineProvider
+            self.root.setBackground(u.shape("#FF000000", dp(16)))
+            self.root.setOutlineProvider(ViewOutlineProvider.BACKGROUND)
+            self.root.setClipToOutline(True)
+        except Exception:
+            pass
+        w = self.dialog.getWindow()
+        width = int(self.act.getResources().getDisplayMetrics().widthPixels * 0.62)
+        w.setLayout(width, int(width * 9 / 16))
+        lp = w.getAttributes()
+        lp.gravity = 0x55        # BOTTOM | END
+        lp.x = dp(12)
+        lp.y = dp(96)
+        w.setAttributes(lp)
+        w.addFlags(0x20 | 0x8)   # NOT_TOUCH_MODAL | NOT_FOCUSABLE — Telegram под плеером работает
+        w.clearFlags(0x2)        # без затемнения
+        self.p.notify_user("Мини-плеер: перетаскивай, нажми — развернуть")
+
+    def exit_mini(self):
+        if not self.mini:
+            return
+        self.mini = False
+        self.mini_bar.setVisibility(8)
+        self.root.setClipToOutline(False)
+        self.root.setBackgroundColor(self.u.c("#FF000000"))
+        w = self.dialog.getWindow()
+        w.clearFlags(0x20 | 0x8)
+        w.setLayout(-1, -1)
+        lp = w.getAttributes()
+        lp.x = lp.y = 0
+        w.setAttributes(lp)
+        self.top.setVisibility(0)
+        self.bottom.setVisibility(0)
+        self.top.setAlpha(1.0)
+        self.bottom.setAlpha(1.0)
+        self.ui_shown = True
+        self.feed.setVisibility(0 if not self.chat_open else 8)
+        if self.chat_open:
+            self.chat.setVisibility(0)
+        self.card_sig = None
+        self.p.update_ui()
+
+    def mini_touch(self, e):
+        act = e.getActionMasked()
+        rx, ry = float(e.getRawX()), float(e.getRawY())
+        t = self.touch
+        if act == 0:
+            lp = self.dialog.getWindow().getAttributes()
+            self.touch = {"rx": rx, "ry": ry, "x": lp.x, "y": lp.y, "moved": False}
+            return True
+        if not t:
+            return True
+        if act == 2:
+            dx, dy = rx - t["rx"], ry - t["ry"]
+            if abs(dx) + abs(dy) > self.u.dp(8):
+                t["moved"] = True
+            if t["moved"]:
+                w = self.dialog.getWindow()
+                lp = w.getAttributes()
+                lp.x = int(max(0, t["x"] - dx))
+                lp.y = int(max(0, t["y"] - dy))
+                w.setAttributes(lp)
+        elif act in (1, 3):
+            if not t.get("moved") and act == 1:
+                self.exit_mini()
+            self.touch = {}
+        return True
 
     # ---------- закрытие ----------
+
+    def on_back(self):
+        if self.mini:
+            self.exit_mini()
+        elif self.chat_open:
+            self.toggle_chat()
+        else:
+            self.p.ask_close()
+
+    def rotate(self):
+        try:
+            cur = self.act.getRequestedOrientation()
+            self.act.setRequestedOrientation(-1 if cur == 6 else 6)
+        except Exception as e:
+            self.p.log_err(f"поворот: {e}")
 
     def close(self):
         if not self.alive:
             return
         self.alive = False
-        try:
-            self.vv.stopPlayback()
-        except Exception:
-            pass
+        self.media.release()
         try:
             self.dialog.dismiss()
         except Exception:
@@ -1151,7 +2170,10 @@ class Player:
         self.p.on_player_closed(self)
 
 
-# ---------------- плагин ----------------
+def _ellipsize():
+    from android.text import TextUtils
+    return TextUtils.TruncateAt.END
+
 
 # ---------------- плагин ----------------
 
@@ -1167,7 +2189,7 @@ class RoomEvents:
         self._ui(lambda: self.p.on_room(info))
 
     def on_state(self, st):
-        self._ui(lambda: self.p.on_state(st))
+        self._ui(lambda: self.p.update_ui())
 
     def on_end(self):
         self._ui(self.p.on_end)
@@ -1178,8 +2200,26 @@ class RoomEvents:
     def on_chat(self, msg):
         self._ui(lambda: self.p.on_chat(msg))
 
+    def on_react(self, msg):
+        self._ui(lambda: self.p.on_react(msg))
+
+    def on_wait(self, msg):
+        self._ui(lambda: self.p.on_wait(msg))
+
+    def on_role(self, role):
+        self._ui(lambda: self.p.on_role(role))
+
+    def on_host_changed(self, uid):
+        self._ui(lambda: self.p.on_host_changed(uid))
+
+    def on_claimed(self):
+        self._ui(self.p.on_claimed)
+
+    def on_code_taken(self):
+        self._ui(self.p.on_code_taken)
+
     def on_status(self, s):
-        self._ui(lambda: self.p.on_status(s))
+        self._ui(self.p.update_titles)
 
     def on_log(self, s):
         self.p.log_err(f"связь: {s}")
@@ -1189,7 +2229,7 @@ class WtogetherPlugin(BasePlugin):
 
     def on_plugin_load(self):
         self.room = None
-        self.mo = None
+        self.source = None          # {"src": "tg", "mo", "title"} | {"src": "url"/"yt", ...}
         self.player = None
         self.started = False
         self.talk = []
@@ -1201,6 +2241,8 @@ class WtogetherPlugin(BasePlugin):
         self.last_prog = -1
         self.join_deadline = 0
         self.chat_did = 0
+        self.broker_index = 0
+        self.shared_once = False
         self.running = True
 
         self.add_hook("TL_updateNewMessage")
@@ -1212,13 +2254,24 @@ class WtogetherPlugin(BasePlugin):
             self.nc_delegate = None
             self.log_err(f"NotificationCenter: {e}")
 
+        # вход в один тап: ссылка https://wtogether.join/КОД открывает комнату
+        self.link_hooks = 0
+        for cls_name, method in (("org.telegram.messenger.browser.Browser", "openUrl"),
+                                 ("org.telegram.ui.Components.AlertsCreator", "showOpenUrlAlert")):
+            try:
+                cls = find_class(cls_name)
+                if cls:
+                    self.link_hooks += len(self.hook_all_methods(cls, method, JoinLinkHook(self)) or [])
+            except Exception as e:
+                self.log_err(f"перехват ссылок: {e}")
+
         self.add_menu_item(MenuItemData(menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
                                         text="🎬 Смотреть вместе", on_click=self.on_watch_click))
         self.add_menu_item(MenuItemData(menu_type=MenuItemType.CHAT_ACTION_MENU,
                                         text="🎬 Wtogether", on_click=lambda ctx: self.open_panel()))
         try:
             self.add_menu_item(MenuItemData(menu_type=MenuItemType.DRAWER_MENU,
-                                            text="Wtogether: войти по коду", on_click=lambda ctx: self.ask_code()))
+                                            text="Wtogether", on_click=lambda ctx: self.open_panel()))
         except Exception as e:
             self.log_err(f"меню: {e}")
         self.logger.info(f"Wtogether {__version__} загружен")
@@ -1261,8 +2314,9 @@ class WtogetherPlugin(BasePlugin):
         return frag.getParentActivity() if frag else None
 
     def notify_user(self, text):
-        if self.player is not None and self.player.alive:
-            self.player.bubble("Wtogether", text)
+        pl = self.player
+        if pl is not None and pl.alive and not pl.mini:
+            pl.show_banner(text)
         elif self.get_setting("notify", True):
             BulletinHelper.show_info(text)
 
@@ -1291,13 +2345,19 @@ class WtogetherPlugin(BasePlugin):
             return None
 
     def host_name(self):
-        if self.room is None:
+        r = self.room
+        if r is None:
             return ""
         if self.is_host():
             return self.my_name()
-        return (self.room.info or {}).get("hn") or "ведущий"
+        return (r.info or {}).get("hn") or "ведущий"
 
-    # ---------- видеофайл ----------
+    def member_name(self, uid):
+        r = self.room
+        m = r.members.get(int(uid), {}) if r else {}
+        return m.get("n") or "Участник"
+
+    # ---------- видеофайл из Telegram ----------
 
     def doc_of(self, mo):
         try:
@@ -1347,90 +2407,130 @@ class WtogetherPlugin(BasePlugin):
 
     def video_title(self, mo):
         try:
-            name = mo.getDocumentName() if hasattr(mo, "getDocumentName") else None
             cap = str(mo.caption) if getattr(mo, "caption", None) else ""
-            return (cap.strip().split("\n")[0][:60] or (str(name) if name else "") or "Видео")
+            name = str(mo.getDocumentName()) if hasattr(mo, "getDocumentName") and mo.getDocumentName() else ""
+            return (cap.strip().split("\n")[0][:60] or name or "Видео")
         except Exception:
             return "Видео"
 
     # ---------- создание комнаты ----------
 
     def on_watch_click(self, context):
-        self.run_safe(lambda: self.start_host(context.get("message")))
+        self.run_safe(lambda: self.watch_message(context.get("message")))
 
-    def start_host(self, mo, broker_index=0):
+    def watch_message(self, mo):
         if mo is None or not mo.isVideo():
             BulletinHelper.show_error("Выбери сообщение с видео")
             return
-        if self.room is not None:
-            self.confirm("Уже идёт просмотр", "Закончить текущий и начать с этим видео?", "Начать",
-                         lambda: (self.end_session(), self.start_host(mo)))
-            return
-        self.mo = mo
-        self.started = False
-        self.talk = []
-        code = new_code(broker_index)
-        info = {"doc": self.doc_of(mo), "title": self.video_title(mo)}
+        info = {"src": "tg", "doc": self.doc_of(mo), "title": self.video_title(mo)}
         try:
             info["dur"] = int(mo.getDuration() * 1000)
         except Exception:
             pass
-        self.room = Room(self.my_uid(), self.my_name(), RoomEvents(self))
-        self.room.host(code, info)
         self.chat_did = int(mo.getDialogId())
-        self.open_player(mo)
-        self.share_code()
-        # если брокер недоступен — пробуем следующий, пока никто не зашёл
-        run_on_ui_thread(lambda: self.check_host_connection(broker_index), 9000)
+        self.start_host(dict(info, mo=mo), info)
 
-    def check_host_connection(self, broker_index):
-        r = self.room
-        if r is None or not self.is_host() or (r.client and r.client.connected):
+    def watch_link(self, url):
+        info = media_from_url(url)
+        if not info:
+            BulletinHelper.show_error("Нужна ссылка https://… на YouTube или видеофайл")
             return
-        if len(r.members) > 1 or broker_index + 1 >= len(BROKERS):
+        self.chat_did = 0
+        self.start_host(dict(info), info)
+
+    def start_host(self, source, info, broker_index=0):
+        if self.room is not None:
+            self.confirm("Уже идёт просмотр", "Закончить текущий и начать новый?", "Начать",
+                         lambda: (self.end_session(), self.start_host(source, info, broker_index)))
+            return
+        self.source = source
+        self.room_info = info
+        self.broker_index = broker_index
+        self.started = False
+        self.talk = []
+        self.shared_once = False
+        self.new_room(broker_index)
+        self.open_player()
+
+    def new_room(self, broker_index):
+        self.room = Room(self.my_uid(), self.my_name(), RoomEvents(self))
+        self.room.host(new_code(broker_index), self.room_info)
+        r = self.room
+        run_on_ui_thread(lambda: self.check_host_connection(r, broker_index), 10000)
+
+    def check_host_connection(self, r, broker_index):
+        """Брокер не ответил — переезжаем на следующий (пока никто не зашёл)."""
+        if self.room is not r or r.claimed or broker_index + 1 >= len(BROKERS):
             return
         self.log_err(f"брокер {BROKERS[broker_index][0]} недоступен, пробую следующий")
-        mo = self.mo
         self.close_room()
-        pl, self.player = self.player, None
-        if pl is not None:
-            pl.close()
-        self.start_host(mo, broker_index + 1)
+        self.broker_index = broker_index + 1
+        self.new_room(broker_index + 1)
+
+    def on_code_taken(self):
+        if not self.is_host():
+            return
+        self.close_room()
+        self.new_room(self.broker_index)
+
+    def on_claimed(self):
+        if self.player is not None:
+            self.player.card_sig = None
+        self.update_ui()
+        if not self.shared_once:
+            self.shared_once = True
+            self.share_code()
+
+    def invite_text(self, code):
+        title = (self.source or {}).get("title") or "видео"
+        return (f"🎬 <b>Смотрим вместе</b> — {html_escape(title)}\n"
+                f"Комната <code>{code}</code>\n\n"
+                f'<a href="https://{JOIN_HOST}{code}">▶️ Войти в комнату</a>\n'
+                "<i>Нужен плагин Wtogether для exteraGram</i>" + zw_encode({"t": "code", "c": code}))
+
+    def send_invite(self, did):
+        if not self.is_host():
+            return
+        text = self.invite_text(self.room.code)
+        mo = (self.source or {}).get("mo")
+        try:
+            if mo is not None and int(mo.getDialogId()) == did:
+                send_text(did, text, parse_mode="HTML", replyToMsg=mo)
+            else:
+                send_text(did, text, parse_mode="HTML")
+            BulletinHelper.show_success("Приглашение отправлено")
+        except Exception as e:
+            self.log_err(f"приглашение: {e}")
+            send_text(did, f"🎬 Смотрим вместе! Комната {self.room.code}" + zw_encode({"t": "code", "c": self.room.code}))
+
+    def copy_code(self):
+        if self.room is not None:
+            copy_to_clipboard(self.room.code)
 
     def share_code(self):
         if not self.is_host():
             return
         code = self.room.code
-        did = getattr(self, "chat_did", 0)
-
-        def send_to_chat():
-            text = (f"🎬 Смотрим вместе в Wtogether!\nКод комнаты: {code}\n\n"
-                    "Нажми «Смотреть» во всплывшем окне или: меню чата ⋮ → «🎬 Wtogether» → «Войти по коду». "
-                    "Нужен плагин Wtogether для exteraGram." + zw_encode({"t": "code", "c": code}))
-            try:
-                send_text(did, text, replyToMsg=self.mo)
-            except Exception:
-                send_text(did, text)
-            BulletinHelper.show_success("Код отправлен в чат")
+        did = self.chat_did
 
         def ui():
             act = self.activity()
             if act is None:
                 return
             b = AlertDialogBuilder(act)
-            b.set_title(f"Код комнаты: {code}")
-            b.set_message("Отправь код другу. Он вводит его в Wtogether и попадает к тебе в комнату.\n\n"
-                          "Можно позвать сразу нескольких человек — у всех один и тот же код.")
+            b.set_title(f"Комната {code}")
+            b.set_message("Позови друзей: они нажмут «Войти в комнату» в приглашении или введут код в Wtogether.\n\n"
+                          "Код один на всех.")
             if did > 0:
-                b.set_positive_button("Отправить в чат", lambda bb, w: (bb.dismiss(), self.run_safe(send_to_chat)))
-            b.set_neutral_button("Скопировать", lambda bb, w: (bb.dismiss(), copy_to_clipboard(code)))
+                b.set_positive_button("Пригласить в этот чат", lambda bb, w: (bb.dismiss(), self.run_safe(lambda: self.send_invite(did))))
+            b.set_neutral_button("Скопировать код", lambda bb, w: (bb.dismiss(), copy_to_clipboard(code)))
             b.set_negative_button("Закрыть", lambda bb, w: bb.dismiss())
             b.show()
         run_on_ui_thread(ui)
 
     # ---------- вход по коду ----------
 
-    def ask_code(self, prefill=""):
+    def input_dialog(self, title, hint, ok, fn, digits=False, prefill=""):
         holder = {}
 
         def ui():
@@ -1439,48 +2539,62 @@ class WtogetherPlugin(BasePlugin):
                 return
             from android.widget import EditText
             e = EditText(act)
-            e.setHint("Например: K7P4QD")
+            e.setHint(hint)
             e.setText(prefill)
             e.setSingleLine(True)
-            e.setTextSize(22.0)
-            e.setGravity(17)
+            if digits:
+                e.setTextSize(28.0)
+                e.setGravity(17)
+                e.setInputType(2)  # цифры
+                e.setLetterSpacing(0.3)
+            else:
+                e.setTextSize(16.0)
+                e.setInputType(0x11)  # ссылка
             try:
-                e.setInputType(0x1001)  # текст, ЗАГЛАВНЫЕ
                 from org.telegram.ui.ActionBar import Theme
                 e.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
                 e.setHintTextColor(Theme.getColor(Theme.key_dialogTextHint))
+                from org.telegram.messenger import AndroidUtilities
+                pad = AndroidUtilities.dp(22.0)
+                e.setPadding(pad, pad // 2, pad, pad // 2)
             except Exception:
                 pass
             holder["e"] = e
             b = AlertDialogBuilder(act)
-            b.set_title("🎬 Войти по коду")
+            b.set_title(title)
             b.set_view(e)
-
-            def go(bb, w):
-                bb.dismiss()
-                code = normalize_code(str(holder["e"].getText()))
-                if not code:
-                    BulletinHelper.show_error("Код — 6 символов, например K7P4QD")
-                    return
-                self.run_safe(lambda: self.join_code(code))
-            b.set_positive_button("Войти", go)
+            b.set_positive_button(ok, lambda bb, w: (bb.dismiss(), self.run_safe(lambda: fn(str(holder["e"].getText())))))
             b.set_negative_button("Отмена", lambda bb, w: bb.dismiss())
             b.show()
         run_on_ui_thread(ui)
 
+    def ask_code(self):
+        def go(text):
+            code = normalize_code(text)
+            if not code:
+                BulletinHelper.show_error("Код — 4 цифры, например 4821")
+                return
+            self.join_code(code)
+        self.input_dialog("🎟 Войти по коду", "4821", "Войти", go, digits=True)
+
+    def ask_link(self):
+        self.input_dialog("🔗 Смотреть по ссылке", "https://youtu.be/… или ссылка на .mp4", "Смотреть",
+                          self.watch_link)
+
     def join_code(self, code):
         if self.room is not None:
             if self.room.code == code:
-                if self.player is None and self.mo is not None:
-                    self.open_player(self.mo)
+                if self.player is None and self.source is not None:
+                    self.open_player()
                 return
-            self.confirm("Уже идёт просмотр", "Выйти из текущего и зайти по новому коду?", "Зайти",
+            self.confirm("Уже идёт просмотр", "Выйти из текущего и зайти в новую комнату?", "Зайти",
                          lambda: (self.end_session(), self.join_code(code)))
             return
-        self.mo = None
+        self.source = None
         self.talk = []
         self.nudging = False
         self.last_prog = -1
+        self.started = False
         self.room = Room(self.my_uid(), self.my_name(), RoomEvents(self))
         self.room.join(code)
         self.join_deadline = time.time() + 12
@@ -1488,20 +2602,29 @@ class WtogetherPlugin(BasePlugin):
         run_on_ui_thread(self.check_join, 12500)
 
     def check_join(self):
-        if self.is_guest() and self.room.info is None and time.time() >= self.join_deadline:
-            ended = self.room.ended
+        r = self.room
+        if not self.is_guest() or time.time() < self.join_deadline:
+            return
+        if r.info is None:
+            ended = r.ended
             self.close_room()
             self.dialog_ok("Комната не найдена",
-                           "Просмотр по этому коду уже закончился." if ended else
+                           "Просмотр в этой комнате уже закончился." if ended else
                            "Проверь код. Если код верный — у ведущего или у тебя нет интернета.")
+        elif r.host_uid() not in r.members:
+            self.notify_user("Ведущий сейчас не в сети — ждём его")
 
     def on_room(self, info):
-        if not self.is_guest() or self.mo is not None:
+        if not self.is_guest() or self.source is not None:
             return
-        doc = int(info.get("doc") or 0)
-        host = int(info.get("host") or 0)
+        src = info.get("src") or "tg"
+        if src in ("yt", "url"):
+            self.source = dict(info)
+            self.open_player()
+            return
         BulletinHelper.show_info(f"Ищу видео «{info.get('title') or 'Видео'}»…")
-        self.find_video(doc, host, lambda mo: self.on_video_found(mo, info))
+        self.find_video(int(info.get("doc") or 0), int(info.get("host") or 0),
+                        lambda mo: self.on_video_found(mo, info))
 
     def on_video_found(self, mo, info):
         if not self.is_guest():
@@ -1510,11 +2633,11 @@ class WtogetherPlugin(BasePlugin):
             hn = info.get("hn") or "ведущий"
             self.close_room()
             self.dialog_ok("Нет этого видео",
-                           f"У тебя в Telegram не нашлось видео из комнаты.\n\n"
-                           f"Попроси {hn} переслать его тебе в личку и снова войди по коду.")
+                           f"Видео из комнаты не нашлось у тебя в Telegram.\n\n"
+                           f"Попроси {hn} переслать его тебе в личку и войди снова.")
             return
-        self.mo = mo
-        self.open_player(mo)
+        self.source = {"src": "tg", "mo": mo, "title": info.get("title") or "Видео"}
+        self.open_player()
 
     def find_video(self, doc, host, done):
         """Ищем видео: сначала в чате с ведущим, потом во всех чатах."""
@@ -1568,11 +2691,11 @@ class WtogetherPlugin(BasePlugin):
 
     # ---------- плеер ----------
 
-    def open_player(self, mo):
+    def open_player(self):
         if self.player is not None and self.player.alive:
             return
         try:
-            self.player = Player(self, mo)
+            self.player = Player(self, self.source)
             self.update_ui()
         except Exception as e:
             self.player = None
@@ -1586,6 +2709,10 @@ class WtogetherPlugin(BasePlugin):
             self.room.publish_state(False, 0, 1.0)
         self.update_ui()
 
+    def on_buffering(self, on):
+        if self.is_guest():
+            self.room.set_progress("buffering" if on else "ready", 100)
+
     def on_completed(self):
         if self.is_host():
             self.publish_host_state()
@@ -1595,11 +2722,11 @@ class WtogetherPlugin(BasePlugin):
         r = self.room
         if r is None:
             return []
-        dots = {"ready": ONLINE, "loading": WAITING, "joined": OFFLINE}
+        dots = {"ready": ONLINE, "loading": WAITING, "buffering": WAITING, "joined": OFFLINE}
+        host_uid = r.host_uid()
         people = []
-        host_uid = r.uid if self.is_host() else int((r.info or {}).get("host") or 0)
-        for uid, m in sorted(r.members.items(), key=lambda kv: (not kv[1].get("host"), kv[0])):
-            dot = ONLINE if m.get("host") else dots.get(m.get("s"), OFFLINE)
+        for uid, m in sorted(r.members.items(), key=lambda kv: (kv[0] != host_uid, kv[0])):
+            dot = ONLINE if uid == host_uid else dots.get(m.get("s"), OFFLINE)
             people.append((self.tg_user(uid), m.get("n") or "?", dot, uid == host_uid))
         return people
 
@@ -1628,10 +2755,7 @@ class WtogetherPlugin(BasePlugin):
         if not self.started:
             self.host_start()
             return
-        if pl.playing():
-            pl.pause()
-        else:
-            pl.play()
+        pl.pause() if pl.playing() else pl.play()
         self.publish_host_state()
 
     def host_skip(self, delta):
@@ -1651,14 +2775,41 @@ class WtogetherPlugin(BasePlugin):
         if not self.is_host() or pl is None:
             return
         if not pl.playing():
-            BulletinHelper.show_info("Скорость меняется во время воспроизведения")
+            self.notify_user("Скорость меняется во время воспроизведения")
             return
         cur = pl.speed or 1.0
         nxt = SPEEDS[(SPEEDS.index(cur) + 1) % len(SPEEDS)] if cur in SPEEDS else 1.0
         pl.set_speed(nxt)
-        if pl.btn_speed is not None:
-            pl.btn_speed.setText(f"{nxt:g}×")
+        pl.set_speed_label(nxt)
         self.publish_host_state()
+
+    def on_wait(self, msg):
+        n = msg.get("n") or "Кто-то"
+        pl = self.player
+        if pl is None or not pl.prepared:
+            return
+        if not pl.playing():
+            self.notify_user(f"✋ {n} просит подождать")
+            return
+        if self.get_setting("auto_pause", True):
+            pl.pause()
+            self.publish_host_state()
+            self.notify_user(f"⏸ Пауза — {n} просит подождать")
+        elif not pl.mini:
+            pl.show_banner(f"✋ {n} просит подождать", "Пауза",
+                           lambda: (pl.pause(), self.publish_host_state()), seconds=10)
+
+    def transfer_control(self):
+        r = self.room
+        if not self.is_host():
+            return
+        uids = [u for u in r.members if u != r.uid]
+        if not uids:
+            self.notify_user("В комнате пока никого нет")
+            return
+        names = [r.members[u].get("n") or "?" for u in uids]
+        self.pick("👑 Кому передать управление?", names,
+                  lambda i: (r.transfer(uids[i]), self.notify_user(f"👑 Управление у {names[i]}")))
 
     # ---------- зритель ----------
 
@@ -1667,10 +2818,12 @@ class WtogetherPlugin(BasePlugin):
             self.room.ping()
             if self.player is not None:
                 self.player.seek_block_until = 0
-            BulletinHelper.show_info("Догоняю ведущего…")
+            self.notify_user("Догоняю ведущего…")
 
-    def on_state(self, st):
-        self.update_ui()
+    def ask_wait(self):
+        if self.is_guest():
+            self.room.ask_wait()
+            self.notify_user(f"✋ Попросил(а) {self.host_name()} подождать")
 
     def on_end(self):
         hn = self.host_name()
@@ -1680,32 +2833,60 @@ class WtogetherPlugin(BasePlugin):
             pl.close()
         self.dialog_ok("Просмотр закончен", f"{hn} закончил(а) совместный просмотр.")
 
-    # ---------- общие события ----------
+    # ---------- роли ----------
+
+    def on_role(self, role):
+        pl = self.player
+        if role == "host":
+            st = self.room.st
+            self.started = bool(st and (st["p"] or st["pos"] > 0))
+            self.publish_host_state()
+            self.notify_user("👑 Теперь ведёшь ты")
+        else:
+            self.nudging = False
+            self.last_ping = 0
+            self.notify_user(f"👑 Теперь ведёт {self.host_name()}")
+        if pl is not None and pl.alive:
+            pl.rebuild_controls()
+            pl.card_sig = None
+        self.update_ui()
+
+    def on_host_changed(self, uid):
+        self.notify_user(f"👑 Теперь ведёт {self.member_name(uid)}")
+        self.update_ui()
+
+    # ---------- общение ----------
 
     def on_members(self, joined, left):
         r = self.room
         if r is None:
             return
         if joined:
-            n = r.members.get(joined, {}).get("n") or "Кто-то"
-            self.notify_user(f"🟢 {n} в комнате")
+            self.notify_user(f"🟢 {self.member_name(joined)} в комнате")
         if left:
             self.notify_user("👋 Участник вышел")
-            if self.is_guest() and int((r.info or {}).get("host") or 0) == left:
+            if self.is_guest() and r.host_uid() == left:
                 self.notify_user("Ведущий отключился — ждём возвращения")
         self.update_ui()
 
     def on_chat(self, msg):
         who, x = msg.get("n") or "?", str(msg.get("x") or "")[:300]
-        self.talk.append((int(msg.get("at") or 0), who, x))
+        at = int(msg.get("at") or 0)
+        self.talk.append((at, who, x))
         if self.player is not None:
-            self.player.bubble(who, x)
+            self.player.add_message(who, x, False, at)
         else:
             self.notify_user(f"💬 {who}: {x}")
 
-    def on_status(self, s):
+    def on_react(self, msg):
+        if self.player is not None and not self.player.mini:
+            self.player.fly(msg.get("e") or "❤️", msg.get("n") or "")
+
+    def send_reaction(self, e):
+        if self.room is not None:
+            self.room.react(e)
         if self.player is not None:
-            self.update_titles()
+            self.player.fly(e, "")
 
     def say_all(self, text):
         if self.room is None:
@@ -1714,7 +2895,7 @@ class WtogetherPlugin(BasePlugin):
         self.room.chat(text, at)
         self.talk.append((at, self.my_name(), text[:300]))
         if self.player is not None:
-            self.player.bubble("Я", text, mine=True)
+            self.player.add_message("Я", text, True, at)
 
     def start_call(self):
         r = self.room
@@ -1722,18 +2903,13 @@ class WtogetherPlugin(BasePlugin):
             return
         uids = [u for u in r.members if u != r.uid]
         if not uids:
-            BulletinHelper.show_info("В комнате пока никого нет")
+            self.notify_user("В комнате пока никого нет")
             return
         if len(uids) == 1:
             self.call_user(uids[0])
             return
-        act = self.activity()
-        b = AlertDialogBuilder(act)
-        b.set_title("📞 Кому позвонить?")
-        b.set_items([r.members[u].get("n") or "?" for u in uids],
-                    lambda bb, i: (bb.dismiss(), self.call_user(uids[int(i)])))
-        b.set_negative_button("Отмена", lambda bb, w: bb.dismiss())
-        b.show()
+        self.pick("📞 Кому позвонить?", [r.members[u].get("n") or "?" for u in uids],
+                  lambda i: self.call_user(uids[i]))
 
     def call_user(self, uid):
         try:
@@ -1745,17 +2921,65 @@ class WtogetherPlugin(BasePlugin):
                 BulletinHelper.show_error("Этого человека нет в твоих чатах — позвони из Telegram")
                 return
             full = mc.getUserFull(int(uid))
+            if self.player is not None and not self.player.mini:
+                self.player.enter_mini()
             VoIPHelper.startCall(user, False, bool(full is not None and full.video_calls_available),
                                  self.activity(), full, AccountInstance.getInstance(UserConfig.selectedAccount))
         except Exception as e:
             self.log_err(f"звонок: {e}")
             BulletinHelper.show_error("Не удалось начать звонок")
 
+    # ---------- меню «⋯» и участники ----------
+
+    def open_more(self):
+        pl = self.player
+        items = []
+        if self.is_host():
+            items.append(("Пригласить / код комнаты", self.share_code))
+            items.append(("Передать управление 👑", self.transfer_control))
+        items += [("Участники", self.open_people),
+                  ("Позвонить", self.start_call),
+                  ("Мини-плеер", pl.enter_mini if pl else None),
+                  ("Повернуть экран", pl.rotate if pl else None),
+                  ("Закончить просмотр" if self.is_host() else "Выйти из комнаты", self.ask_close)]
+        items = [(t, f) for t, f in items if f]
+        self.pick("Wtogether", [t for t, _ in items], lambda i: items[i][1]())
+
+    def open_people(self):
+        r = self.room
+        if r is None:
+            return
+        host = r.host_uid()
+        st = {"ready": "готов(а)", "loading": "загружает", "buffering": "подгружает", "joined": "подключается"}
+        lines = []
+        for uid, m in sorted(r.members.items(), key=lambda kv: (kv[0] != host, kv[0])):
+            name = ("Я" if uid == r.uid else m.get("n") or "?")
+            if uid == host:
+                lines.append(f"👑 {name} — ведущий")
+            else:
+                s = st.get(m.get("s"), m.get("s") or "")
+                if m.get("s") == "loading":
+                    s += f" {m.get('pc', 0)}%"
+                lines.append(f"• {name} — {s}")
+        self.dialog_ok(f"Комната {r.code} · {len(r.members)}", "\n".join(lines))
+
+    def pick(self, title, labels, fn):
+        def ui():
+            act = self.activity()
+            if act is None:
+                return
+            b = AlertDialogBuilder(act)
+            b.set_title(title)
+            b.set_items(labels, lambda bb, i: (bb.dismiss(), self.run_safe(lambda: fn(int(i)))))
+            b.set_negative_button("Отмена", lambda bb, w: bb.dismiss())
+            b.show()
+        run_on_ui_thread(ui)
+
     # ---------- цикл плеера ----------
 
     def on_tick(self, pl):
         r = self.room
-        if r is None:
+        if r is None or pl.mini and not pl.prepared:
             return
         if self.is_host():
             if pl.countdown_at:
@@ -1764,8 +2988,8 @@ class WtogetherPlugin(BasePlugin):
                     pl.countdown_at = 0
                     pl.play()
                     self.update_ui()
-                else:
-                    pl.set_state(str(left // 1000 + 1), "Старт для всех", False)
+                elif not pl.mini:
+                    pl.show_card("countdown", text="Старт для всех", big=left // 1000 + 1)
             elif pl.playing() and time.time() - self.last_beat > HEARTBEAT_S:
                 self.publish_host_state()
             self.update_titles()
@@ -1779,12 +3003,18 @@ class WtogetherPlugin(BasePlugin):
             self.last_ping = time.time()
             r.ping()
         st = r.st
-        self.guest_center(pl)
+        if not pl.mini:
+            self.guest_card(pl)
         if st is None:
             pl.pause()
             return
         room_now = r.room_now()
         play, seek, speed, self.nudging = plan_correction(st, room_now, pl.position(), pl.playing(), self.nudging)
+        if not pl.fine_speed:
+            # YouTube: только фиксированные скорости — подтягиваемся перемоткой
+            speed = st["r"]
+            if play and pl.playing() and abs(pl.position() - expected_pos(st, room_now)) > 700:
+                seek = int(expected_pos(st, room_now))
         if seek is not None and time.time() > pl.seek_block_until:
             pl.seek_to(seek)
         if play:
@@ -1793,50 +3023,57 @@ class WtogetherPlugin(BasePlugin):
         else:
             pl.pause()
 
+    def guest_card(self, pl):
+        r = self.room
+        st = r.st if r is not None else None
+        if st is None or (not st["p"] and st["pos"] == 0):
+            me = r.members.get(r.uid, {}) if r else {}
+            mine = "ты готов(а) ✓" if me.get("s") == "ready" else "загружаешь видео…"
+            pl.show_card("waiting", text=f"Ждём, когда {self.host_name()} начнёт",
+                         big=f"Комната {r.code} · {mine}",
+                         people=(self.tg_user(r.host_uid()), self.host_name()))
+        elif st["p"] and r.room_now() < st["ts"]:
+            pl.show_card("countdown", text="Старт для всех", big=(st["ts"] - r.room_now()) // 1000 + 1)
+        else:
+            pl.show_card("none")
+
     def update_titles(self):
         pl, r = self.player, self.room
         if pl is None or not pl.alive or r is None:
             return
+        guests = len([u for u in r.members if u != r.host_uid()])
         link = r.status
         if self.is_host():
-            guests = [m for u, m in r.members.items() if u != r.uid]
-            ready = sum(1 for m in guests if m.get("s") == "ready")
-            pl.set_titles(f"👑 Ты ведёшь · код {r.code}",
-                          (f"готовы {ready} из {len(guests)}" if guests else "ждём зрителей") + f" · {link}")
+            ready = sum(1 for u, m in r.members.items() if u != r.uid and m.get("s") == "ready")
+            sub = (f"👑 ты ведёшь · готовы {ready} из {guests}" if guests else "👑 ты ведёшь · ждём зрителей")
         else:
-            pl.set_titles(f"👑 Ведёт {self.host_name()}", f"код {r.code} · {link}")
+            sub = f"👑 ведёт {self.host_name()} · {guests} зрит."
+        if link != "на связи":
+            sub += f" · {link}"
+        pl.set_titles(None, f"Комната {r.code} · {sub}" if r.claimed or self.is_guest() else "Создаю комнату…")
 
     def update_ui(self):
         pl, r = self.player, self.room
-        if pl is None or not pl.alive or r is None or not pl.prepared:
+        if pl is None or not pl.alive or r is None or not pl.prepared or pl.mini:
             return
         if self.is_host():
             if not self.started:
-                lines = []
+                rows = []
                 for uid, m in r.members.items():
                     if uid == r.uid:
                         continue
-                    s = {"ready": "готов(а)", "loading": f"загружает {m.get('pc', 0)}%",
-                         "joined": "подключается"}.get(m.get("s"), m.get("s"))
-                    lines.append(f"{m.get('n') or '?'} — {s}")
-                pl.set_state("👥", "\n".join(lines) if lines else
-                             f"Ждём зрителей…\nКод комнаты: {r.code}", True)
+                    s = m.get("s")
+                    status = {"ready": "готов(а)", "loading": f"загружает {m.get('pc', 0)}%",
+                              "buffering": "подгружает", "joined": "подключается"}.get(s, s or "")
+                    frac = m.get("pc", 0) if s == "loading" else None
+                    dot = {"ready": ONLINE, "loading": WAITING, "buffering": WAITING}.get(s, OFFLINE)
+                    rows.append((self.tg_user(uid), m.get("n") or "?", status, frac, dot))
+                pl.show_card("lobby", big=r.code if r.claimed else "…", rows=rows)
             elif not pl.countdown_at:
-                pl.set_state("", "", False)
+                pl.show_card("none")
         else:
-            self.guest_center(pl)
+            self.guest_card(pl)
         self.update_titles()
-
-    def guest_center(self, pl):
-        """Что показать зрителю по центру: ожидание, отсчёт или ничего."""
-        r = self.room
-        st = r.st if r is not None else None
-        if st is None or (not st["p"] and st["pos"] == 0):
-            pl.set_state("⏳", f"Ждём, когда {self.host_name()} начнёт", False)
-        elif st["p"] and r.room_now() < st["ts"]:
-            pl.set_state(str((st["ts"] - r.room_now()) // 1000 + 1), "Старт для всех", False)
-        else:
-            pl.set_state("", "", False)
 
     # ---------- завершение ----------
 
@@ -1874,7 +3111,7 @@ class WtogetherPlugin(BasePlugin):
         if self.is_host():
             self.confirm("Закончить просмотр?", "Плеер закроется у всех в комнате.", "Закончить", self.end_session)
         else:
-            self.confirm("Выйти из просмотра?", "Остальные продолжат без тебя. Вернуться можно по тому же коду.",
+            self.confirm("Выйти из комнаты?", "Остальные продолжат без тебя. Вернуться можно по тому же коду.",
                          "Выйти", self.end_session)
 
     def close_room(self):
@@ -1883,11 +3120,9 @@ class WtogetherPlugin(BasePlugin):
             threading.Thread(target=r.close, daemon=True).start()
 
     def end_session(self):
-        if self.is_host() and self.talk and self.get_setting("send_talk", False):
-            did = getattr(self, "chat_did", 0)
-            if did > 0:
-                lines = [f"{fmt_time(at)} {who}: {t}" for at, who, t in sorted(self.talk, key=lambda x: x[0])]
-                send_text(did, ("🎬 Обсуждали видео вместе:\n\n" + "\n".join(lines))[:4000])
+        if self.is_host() and self.talk and self.get_setting("send_talk", False) and self.chat_did > 0:
+            lines = [f"{fmt_time(at)} {who}: {t}" for at, who, t in sorted(self.talk, key=lambda x: x[0])]
+            send_text(self.chat_did, ("🎬 Обсуждали видео вместе:\n\n" + "\n".join(lines))[:4000])
         self.close_room()
         self.started = False
         pl, self.player = self.player, None
@@ -1909,7 +3144,7 @@ class WtogetherPlugin(BasePlugin):
             return "Совместный просмотр не идёт."
         people = ", ".join((m.get("n") or "?") for u, m in r.members.items() if u != r.uid) or "пока никого"
         role = "👑 Ты ведёшь" if self.is_host() else f"👑 Ведёт {self.host_name()}"
-        return f"{role}\nКод комнаты: {r.code}\nВ комнате: {people}\nСвязь: {r.status}"
+        return f"{role}\nКомната {r.code}\nВ комнате: {people}\nСвязь: {r.status}"
 
     def open_panel(self):
         def ui():
@@ -1919,16 +3154,18 @@ class WtogetherPlugin(BasePlugin):
             b = AlertDialogBuilder(act)
             b.set_title("🎬 Wtogether")
             if self.room is None:
-                b.set_message("Смотреть вместе:\n• создать комнату — долгое нажатие на видео → Плагины → "
-                              "«🎬 Смотреть вместе»;\n• зайти к другу — «Войти по коду».")
-                b.set_positive_button("Войти по коду", lambda bb, w: (bb.dismiss(), self.ask_code()))
+                items = [("🎟  Войти по коду", self.ask_code),
+                         ("🔗  Смотреть по ссылке (YouTube, .mp4)", self.ask_link),
+                         ("🎬  Видео из чата: долгое нажатие → Плагины → «Смотреть вместе»", None)]
+                b.set_items([t for t, _ in items],
+                            lambda bb, i: (bb.dismiss(), items[int(i)][1] and self.run_safe(items[int(i)][1])))
                 b.set_negative_button("Закрыть", lambda bb, w: bb.dismiss())
             else:
                 b.set_message(self.status_text())
-                if self.player is None and self.mo is not None:
-                    b.set_positive_button("Открыть плеер", lambda bb, w: (bb.dismiss(), self.open_player(self.mo)))
+                if self.player is None and self.source is not None:
+                    b.set_positive_button("Открыть плеер", lambda bb, w: (bb.dismiss(), self.open_player()))
                 elif self.is_host():
-                    b.set_positive_button("Код комнаты", lambda bb, w: (bb.dismiss(), self.share_code()))
+                    b.set_positive_button("Пригласить", lambda bb, w: (bb.dismiss(), self.share_code()))
                 b.set_negative_button("Закончить" if self.is_host() else "Выйти",
                                       lambda bb, w: (bb.dismiss(), self.run_safe(self.end_session)))
                 b.set_neutral_button("Закрыть", lambda bb, w: bb.dismiss())
@@ -1940,22 +3177,29 @@ class WtogetherPlugin(BasePlugin):
             Header(text="Wtogether"),
             Text(text="🎟 Войти по коду", subtext="Зайти в комнату друга", accent=True,
                  on_click=lambda v: self.ask_code()),
+            Text(text="🔗 Смотреть по ссылке", subtext="YouTube или прямая ссылка на видео",
+                 on_click=lambda v: self.ask_link()),
             Text(text="Сейчас", subtext=self.status_text().replace("\n", " · "), icon="msg_info",
                  on_click=lambda v: self.open_panel()),
             Divider(),
-            Header(text="Настройки"),
-            Switch(key="ask_invite", text="Окно при получении кода в чате", default=True,
-                   subtext="Когда друг присылает код комнаты — предложить войти"),
-            Switch(key="send_talk", text="Отправлять обсуждение в чат", default=False,
-                   subtext="Когда ведущий заканчивает, сообщения из плеера уходят в чат одним сообщением"),
+            Header(text="Просмотр"),
+            Switch(key="gestures", text="Жесты", default=True,
+                   subtext="Двойной тап ±10 с, свайп вбок — перемотка, вверх-вниз — громкость и яркость"),
+            Switch(key="auto_pause", text="Пауза по «✋ Подожди меня»", default=True,
+                   subtext="Если выключить — ведущему придёт запрос с кнопкой «Пауза»"),
             Switch(key="notify", text="Уведомления вне плеера", default=True),
             Divider(),
+            Header(text="Приглашения и чат"),
+            Switch(key="ask_invite", text="Окно при получении приглашения", default=True,
+                   subtext="Когда друг присылает комнату — сразу предложить войти"),
+            Switch(key="send_talk", text="Отправлять обсуждение в чат", default=False,
+                   subtext="Когда ведущий заканчивает, сообщения из плеера уходят в чат одним сообщением"),
+            Divider(),
             Header(text="Как пользоваться"),
-            Text(text="1. Создай комнату", subtext="Долгое нажатие на видео → Плагины → «🎬 Смотреть вместе». "
-                                                   "Появится код"),
-            Text(text="2. Позови", subtext="Отправь код в чат кнопкой или продиктуй. "
-                                           "Друг: «Войти по коду» (здесь, в меню чата ⋮ или в боковом меню)"),
-            Text(text="3. Начните", subtext="Когда все готовы — «▶ Начать для всех». Управляет только ведущий 👑"),
+            Text(text="1. Создай комнату", subtext="Долгое нажатие на видео → Плагины → «🎬 Смотреть вместе» "
+                                                   "или «Смотреть по ссылке»"),
+            Text(text="2. Позови", subtext="«Пригласить» — друг нажмёт «▶️ Войти в комнату». Или скажи код из 4 цифр"),
+            Text(text="3. Начните", subtext="«Начать для всех». Управляет ведущий 👑, его можно сменить в меню «⋯»"),
             Divider(),
             Text(text="🛠 Проверка работы", subtext="Если что-то не так — нажми и пришли текст",
                  on_click=lambda v: self.diagnostics()),
@@ -1965,14 +3209,17 @@ class WtogetherPlugin(BasePlugin):
     def diagnostics(self):
         r = self.room
         lines = [f"Версия {__version__}",
-                 f"Приём кодов из чата: {'да' if self.nc_delegate else 'только хук'}"]
+                 f"Приём приглашений: {'да' if self.nc_delegate else 'только хук'}",
+                 f"Вход по ссылке: {'да' if self.link_hooks else 'нет'} ({self.link_hooks})",
+                 "Нет иконок: " + (", ".join(sorted(UI.missing)) or "все на месте")]
         if r is not None:
             c = r.client
-            lines += [f"Комната: {r.code} ({r.role})",
+            lines += [f"Комната: {r.code} ({r.role}, {'занята' if r.claimed else 'не занята'})",
                       f"Сервер: {c.endpoint if c and c.endpoint else 'не подключено'}",
                       f"Связь: {r.status}",
                       f"Участников: {len(r.members)}",
-                      f"Состояние ведущего: {r.st}"]
+                      f"Источник: {(self.source or {}).get('src')}",
+                      f"Состояние: {r.st}"]
             if r.role == "guest":
                 lines.append(f"Сдвиг часов: {r.offset} мс" + (f", пинг {r.rtt} мс" if r.rtt is not None else ""))
         else:
@@ -1993,7 +3240,7 @@ class WtogetherPlugin(BasePlugin):
             b.show()
         run_on_ui_thread(ui)
 
-    # ---------- код комнаты в сообщениях ----------
+    # ---------- приглашения в сообщениях ----------
 
     def on_update_hook(self, update_name, account, update):
         try:
@@ -2034,19 +3281,17 @@ class WtogetherPlugin(BasePlugin):
             return
         if self.room is not None and self.room.code == code:
             return
-        name = "Друг"
         u = self.tg_user(did)
-        if u is not None and u.first_name:
-            name = u.first_name
+        name = u.first_name if u is not None and u.first_name else "Друг"
 
         def ui():
             act = self.activity()
             if act is None:
-                BulletinHelper.show_info(f"🎬 {name} зовёт смотреть вместе: код {code}")
+                BulletinHelper.show_info(f"🎬 {name} зовёт смотреть вместе: комната {code}")
                 return
             b = AlertDialogBuilder(act)
             b.set_title(f"🎬 {name} зовёт смотреть вместе")
-            b.set_message(f"Код комнаты: {code}\n\n{name} — ведущий 👑: он ставит паузу и перематывает, "
+            b.set_message(f"Комната {code}\n\n{name} — ведущий 👑: ставит паузу и перематывает, "
                           "у тебя всё повторяется само.")
             b.set_positive_button("Смотреть", lambda bb, w: (bb.dismiss(), self.run_safe(lambda: self.join_code(code))))
             b.set_negative_button("Позже", lambda bb, w: bb.dismiss())

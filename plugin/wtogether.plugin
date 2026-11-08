@@ -29,7 +29,7 @@ __id__ = "wtogether"
 __name__ = "Wtogether"
 __description__ = "Смотрите видео вместе: комнаты по коду, ведущий управляет, реакции, чат, жесты, мини-плеер"
 __author__ = "Wtogether"
-__version__ = "4.0.0"
+__version__ = "4.1.0"
 # Иконка: имя_набора_стикеров/номер. После создания своего набора через @Stickers замени на "ИмяНабора/0"
 __icon__ = "exteraPlugins/1"
 __category__ = ["media", "chats"]
@@ -736,7 +736,23 @@ def listeners():
                 return True
             return False
 
-    listeners.cache = dict(Prepared=Prepared, Completed=Completed, Failed=Failed, Info=Info, Touch=Touch,
+    class Press(dynamic_proxy(View.OnTouchListener)):
+        """Кнопка чуть сжимается при нажатии и пружинит обратно. Клик не перехватывает."""
+        def __init__(self):
+            super().__init__()
+
+        def onTouch(self, v, e):
+            from android.view.animation import OvershootInterpolator, DecelerateInterpolator
+            a = e.getActionMasked()
+            if a == 0:
+                v.animate().scaleX(0.86).scaleY(0.86).setStartDelay(0).setDuration(90) \
+                    .setInterpolator(DecelerateInterpolator()).start()
+            elif a in (1, 3):
+                v.animate().scaleX(1.0).scaleY(1.0).setStartDelay(0).setDuration(320) \
+                    .setInterpolator(OvershootInterpolator(3.0)).start()
+            return False
+
+    listeners.cache = dict(Press=Press, Prepared=Prepared, Completed=Completed, Failed=Failed, Info=Info, Touch=Touch,
                            Dismissed=Dismissed, Value=Value, Seek=Seek, Keys=Keys)
     return listeners.cache
 
@@ -809,8 +825,88 @@ ICONS = {
     "copy": ["msg_copy"],
     "share": ["msg_share", "msg_shareout"],
     "leave": ["msg_leave", "msg_endcall"],
+    "check": ["ic_ab_done", "msg_check_s"],
+    "info": ["msg_info", "filled_info"],
+    "warning": ["msg_warning"],
+    "join": ["msg_addcontact"],
+    "timer": ["msg_mini_autodelete_timer", "msg_stories_timer"],
 }
 REACTIONS = ["❤️", "😂", "🔥", "😱", "👏", "😭", "🤯", "💀"]
+# Объёмные эмодзи Microsoft Fluent (лицензия MIT): код символа и имя для запасного адреса
+EMOJI_3D = {
+    "❤️": ("2764-fe0f", "Red heart", False), "😂": ("1f602", "Face with tears of joy", False),
+    "🔥": ("1f525", "Fire", False), "😱": ("1f631", "Face screaming in fear", False),
+    "👏": ("1f44f", "Clapping hands", True), "😭": ("1f62d", "Loudly crying face", False),
+    "🤯": ("1f92f", "Exploding head", False), "💀": ("1f480", "Skull", False),
+}
+
+
+class Emoji3D:
+    """Скачивает объёмные эмодзи один раз в кэш и отдаёт картинки. Без сети — обычные эмодзи."""
+    bitmaps = {}
+
+    @staticmethod
+    def folder():
+        import os
+        from org.telegram.messenger import ApplicationLoader
+        d = os.path.join(str(ApplicationLoader.applicationContext.getCacheDir().getAbsolutePath()), "wtogether_emoji")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    @classmethod
+    def path(cls, e):
+        import os
+        return os.path.join(cls.folder(), EMOJI_3D[e][0] + ".png")
+
+    @classmethod
+    def prefetch(cls, log=None):
+        def run():
+            import os
+            from urllib.parse import quote
+            try:
+                import requests
+            except Exception as ex:
+                if log:
+                    log(f"эмодзи: нет requests ({ex})")
+                return
+            for e, (cp, name, tone) in EMOJI_3D.items():
+                try:
+                    p = cls.path(e)
+                    if os.path.exists(p) and os.path.getsize(p) > 0:
+                        continue
+                    snake = name.lower().replace(" ", "_")
+                    urls = ["https://cdn.jsdelivr.net/npm/@lobehub/fluent-emoji-3d@1.1.0/assets/" + cp + ".webp",
+                            "https://cdn.jsdelivr.net/gh/microsoft/fluentui-emoji@main/assets/" + quote(name) +
+                            ("/Default/3D/" + snake + "_3d_default.png" if tone else "/3D/" + snake + "_3d.png")]
+                    for u in urls:
+                        r = requests.get(u, timeout=15)
+                        if r.status_code == 200 and len(r.content) > 500:
+                            with open(p, "wb") as f:
+                                f.write(r.content)
+                            break
+                except Exception as ex:
+                    if log:
+                        log(f"эмодзи {cp}: {ex}")
+        threading.Thread(target=run, daemon=True).start()
+
+    @classmethod
+    def bitmap(cls, e):
+        if e in cls.bitmaps:
+            return cls.bitmaps[e]
+        if e not in EMOJI_3D:
+            return None
+        try:
+            import os
+            p = cls.path(e)
+            if not os.path.exists(p):
+                return None
+            from android.graphics import BitmapFactory
+            b = BitmapFactory.decodeFile(p)
+            if b is not None:
+                cls.bitmaps[e] = b
+            return b
+        except Exception:
+            return None
 
 
 class UI:
@@ -905,6 +1001,25 @@ class UI:
         t.setGravity(self.Gravity.CENTER)
         return t
 
+    def press(self, view):
+        try:
+            view.setOnTouchListener(listeners()["Press"]())
+        except Exception:
+            pass
+        return view
+
+    def emoji(self, e, size):
+        """Объёмный эмодзи картинкой, если уже скачан, иначе обычный."""
+        b = Emoji3D.bitmap(e)
+        if b is not None:
+            iv = self.IV(self.ctx)
+            iv.setImageBitmap(b)
+            iv.setScaleType(self.IV.ScaleType.FIT_CENTER)
+            return iv
+        t = self.text(e, size * 0.62)
+        t.setGravity(self.Gravity.CENTER)
+        return t
+
     def icon_button(self, key, fallback, size, fn, bg="#26FFFFFF", icon_size=24, badge=False):
         """Круглая кнопка с иконкой Telegram и «волной» при нажатии."""
         dp = self.dp
@@ -915,6 +1030,7 @@ class UI:
         box.addView(ic, self.FL.LayoutParams(dp(icon_size), dp(icon_size), self.Gravity.CENTER))
         box.setOnClickListener(OnClickListener(lambda v: fn()))
         box.setTag(ic)
+        self.press(box)
         if badge:
             b = self.text("", 10.0, True)
             b.setGravity(self.Gravity.CENTER)
@@ -926,27 +1042,34 @@ class UI:
         return box
 
     def seek_button(self, back, fn):
-        """«Перемотать на 10 с»: круговая стрелка и цифра 10, как в плеерах."""
+        """«Перемотать на 10 с»: круговая стрелка с цифрой, при нажатии прокручивается."""
         dp = self.dp
         box = self.FL(self.ctx)
         box.setBackground(self.ripple(self.shape("#00000000", oval=True), oval=True))
         box.setClickable(True)
         rid = self.res("retry")
+        spin = None
         if rid:
-            iv = self.IV(self.ctx)
-            iv.setImageResource(rid)
-            iv.setColorFilter(self.c("#FFFFFFFF"))
+            spin = self.IV(self.ctx)
+            spin.setImageResource(rid)
+            spin.setColorFilter(self.c("#FFFFFFFF"))
             if back:
-                iv.setScaleX(-1.0)
-            box.addView(iv, self.FL.LayoutParams(dp(30), dp(30), self.Gravity.CENTER))
-            n = self.text("10", 9.0, True)
+                spin.setScaleX(-1.0)
+            box.addView(spin, self.FL.LayoutParams(dp(32), dp(32), self.Gravity.CENTER))
+            n = self.text("10", 9.5, True)
             n.setGravity(self.Gravity.CENTER)
             box.addView(n, self.FL.LayoutParams(-2, -2, self.Gravity.CENTER))
         else:
             t = self.text("−10" if back else "+10", 15.0, True)
             t.setGravity(self.Gravity.CENTER)
             box.addView(t, self.FL.LayoutParams(-1, -1))
-        box.setOnClickListener(OnClickListener(lambda v: fn()))
+
+        def click(v):
+            if spin is not None:
+                spin.animate().rotationBy(-360.0 if back else 360.0).setDuration(450).start()
+            fn()
+        box.setOnClickListener(OnClickListener(click))
+        self.press(box)
         return box
 
     def pill_button(self, label, fn, color=None, icon=None, size=15.0):
@@ -964,6 +1087,7 @@ class UI:
             row.addView(ic, lp)
         row.addView(self.text(label, size, True))
         row.setOnClickListener(OnClickListener(lambda v: fn()))
+        self.press(row)
         return row
 
     def avatar(self, user, name, size, dot=None, crown=False):
@@ -1005,6 +1129,8 @@ class VideoMedia:
         from android.widget import VideoView
         self.pl = player
         self.view = VideoView(ctx)
+        # поверхность видео прозрачна до первого кадра — без фона сквозь плеер виден чат
+        self.view.setBackgroundColor(-16777216)
         self.mp = None
         self.prepared = False
         self.duration = 0
@@ -1028,7 +1154,9 @@ class VideoMedia:
         self.pl.on_prepared()
 
     def _info(self, what):
-        if what == 701:
+        if what == 3:            # MEDIA_INFO_VIDEO_RENDERING_START — первый кадр готов
+            self.view.setBackground(None)
+        elif what == 701:
             self.buffering = True
             self.pl.p.on_buffering(True)
         elif what == 702:
@@ -1058,6 +1186,7 @@ class VideoMedia:
 
     def play(self):
         self.view.start()
+        run_on_ui_thread(lambda: self.view.setBackground(None), 400)
 
     def pause(self):
         self.view.pause()
@@ -1293,13 +1422,20 @@ class Player:
         self.gestures.setOnTouchListener(L["Touch"](lambda v, e: self.p.run_safe(lambda: self.on_touch(e))))
         self.root.addView(self.gestures, FL.LayoutParams(-1, -1))
 
-        # слой эффектов: реакции, подсказки жестов
+        # слой эффектов: реакции и подсказки жестов
         self.fx = FL(ctx)
         self.root.addView(self.fx, FL.LayoutParams(-1, -1))
-        self.hint = u.text("", 22.0, True)
-        self.hint.setGravity(G.CENTER)
-        self.hint.setPadding(dp(18), dp(10), dp(18), dp(10))
-        self.hint.setBackground(u.shape("#99000000", dp(20)))
+        self.hint = LL(ctx)
+        self.hint.setOrientation(LL.HORIZONTAL)
+        self.hint.setGravity(G.CENTER_VERTICAL)
+        self.hint.setPadding(dp(16), dp(10), dp(18), dp(10))
+        self.hint.setBackground(u.shape("#B31C1C1E", dp(22)))
+        self.hint_icon = FL(ctx)
+        self.hint.addView(self.hint_icon, LL.LayoutParams(dp(22), dp(22)))
+        self.hint_text = u.text("", 17.0, True)
+        hl = LL.LayoutParams(-2, -2)
+        hl.leftMargin = dp(8)
+        self.hint.addView(self.hint_text, hl)
         self.hint.setAlpha(0.0)
         self.fx.addView(self.hint, FL.LayoutParams(-2, -2, G.CENTER))
 
@@ -1308,7 +1444,8 @@ class Player:
         self.card.setOrientation(LL.VERTICAL)
         self.card.setGravity(G.CENTER_HORIZONTAL)
         clp = FL.LayoutParams(-1, -2, G.CENTER)
-        clp.leftMargin = clp.rightMargin = dp(24)
+        clp.leftMargin = clp.rightMargin = dp(20)
+        clp.bottomMargin = dp(40)
         self.root.addView(self.card, clp)
         self.card.setVisibility(8)
 
@@ -1316,9 +1453,9 @@ class Player:
         self.top = LL(ctx)
         self.top.setOrientation(LL.HORIZONTAL)
         self.top.setGravity(G.CENTER_VERTICAL)
-        self.top.setPadding(dp(10), dp(30), dp(12), dp(18))
+        self.top.setPadding(dp(10), dp(30), dp(12), dp(22))
         self.top.setBackground(u.grad(True))
-        self.top.addView(u.icon_button("close", "✕", 40, self.p.ask_close, "#33000000", 22), LL.LayoutParams(dp(40), dp(40)))
+        self.top.addView(u.icon_button("close", "✕", 40, self.p.ask_close, "#4D000000", 22), LL.LayoutParams(dp(40), dp(40)))
         titles = LL(ctx)
         titles.setOrientation(LL.VERTICAL)
         self.title = u.text(self.source.get("title") or "Wtogether", 16.0, True)
@@ -1326,6 +1463,7 @@ class Player:
         self.title.setEllipsize(_ellipsize())
         self.subtitle = u.text("", 12.5, False, "#B3FFFFFF")
         self.subtitle.setSingleLine(True)
+        self.subtitle.setEllipsize(_ellipsize())
         titles.addView(self.title)
         titles.addView(self.subtitle)
         tlp = LL.LayoutParams(0, -2, 1.0)
@@ -1336,56 +1474,83 @@ class Player:
         self.faces.setOrientation(LL.HORIZONTAL)
         self.faces.setGravity(G.CENTER_VERTICAL)
         self.faces.setPadding(dp(4), dp(4), dp(10), dp(4))
-        self.faces.setBackground(u.ripple(u.shape("#4D000000", dp(22)), radius=dp(22)))
+        self.faces.setBackground(u.ripple(u.shape("#66000000", dp(22)), radius=dp(22)))
         self.faces.setClickable(True)
         self.faces.setOnClickListener(OnClickListener(lambda v: self.p.run_safe(self.p.open_people)))
+        u.press(self.faces)
         self.top.addView(self.faces, LL.LayoutParams(-2, dp(40)))
         self.root.addView(self.top, FL.LayoutParams(-1, -2, G.TOP))
 
-        # плашка «управляет ведущий» / просьбы
+        # плашка уведомлений
         self.banner = LL(ctx)
         self.banner.setOrientation(LL.HORIZONTAL)
         self.banner.setGravity(G.CENTER_VERTICAL)
-        self.banner.setPadding(dp(14), dp(8), dp(8), dp(8))
-        self.banner.setBackground(u.shape("#E61C1C1E", dp(20)))
+        self.banner.setBackground(u.shape("#F01C1C1E", dp(20)))
         self.banner.setVisibility(8)
         blp = FL.LayoutParams(-2, -2, G.TOP | G.CENTER_HORIZONTAL)
-        blp.topMargin = dp(96)
+        blp.topMargin = dp(100)
+        blp.leftMargin = blp.rightMargin = dp(16)
         self.root.addView(self.banner, blp)
 
-        # всплывающие сообщения (когда чат закрыт)
+        # всплывающие сообщения слева (когда чат закрыт)
         self.feed = LL(ctx)
         self.feed.setOrientation(LL.VERTICAL)
-        flp = FL.LayoutParams(dp(280), -2, G.BOTTOM | G.START)
+        flp = FL.LayoutParams(dp(240), -2, G.BOTTOM | G.START)
         flp.leftMargin = dp(14)
-        flp.bottomMargin = dp(150)
+        flp.bottomMargin = dp(142)
         self.root.addView(self.feed, flp)
 
-        # выбор реакции
+        # столбик справа, как в стримах: чат, реакции, меню
+        self.col = LL(ctx)
+        self.col.setOrientation(LL.VERTICAL)
+        self.col.setGravity(G.CENTER_HORIZONTAL)
+        self.btn_chat = u.icon_button("chat", "💬", 46, self.toggle_chat, "#8C1C1C1E", 24, badge=True)
+        self.chat_badge = u.last_badge
+        self.btn_react = u.icon_button("react", "♡", 46, self.toggle_reactions, "#8C1C1C1E", 24)
+        self.btn_more = u.icon_button("more", "⋯", 46, lambda: self.p.run_safe(self.p.open_more), "#8C1C1C1E", 24)
+        for i, b in enumerate((self.btn_chat, self.btn_react, self.btn_more)):
+            lp = LL.LayoutParams(dp(46), dp(46))
+            if i:
+                lp.topMargin = dp(10)
+            self.col.addView(b, lp)
+        col_lp = FL.LayoutParams(-2, -2, G.BOTTOM | G.END)
+        col_lp.rightMargin = dp(12)
+        col_lp.bottomMargin = dp(142)
+        self.root.addView(self.col, col_lp)
+
+        # выбор реакции: две строки по четыре объёмных эмодзи
         self.react_bar = LL(ctx)
-        self.react_bar.setOrientation(LL.HORIZONTAL)
-        self.react_bar.setPadding(dp(6), dp(4), dp(6), dp(4))
-        self.react_bar.setBackground(u.shape("#F01C1C1E", dp(26)))
-        for e in REACTIONS:
-            b = u.text(e, 24.0)
-            b.setGravity(G.CENTER)
-            b.setBackground(u.ripple(u.shape("#00000000", oval=True), oval=True))
-            b.setClickable(True)
-            b.setOnClickListener(OnClickListener(lambda v, e=e: self.p.run_safe(lambda: self.p.send_reaction(e))))
-            self.react_bar.addView(b, LL.LayoutParams(dp(42), dp(44)))
-        rlp = FL.LayoutParams(-2, -2, G.BOTTOM | G.CENTER_HORIZONTAL)
-        rlp.bottomMargin = dp(140)
+        self.react_bar.setOrientation(LL.VERTICAL)
+        self.react_bar.setPadding(dp(8), dp(8), dp(8), dp(8))
+        self.react_bar.setBackground(u.shape("#F21C1C1E", dp(24)))
+        self.react_cells = []
+        for r0 in (0, 4):
+            line = LL(ctx)
+            line.setOrientation(LL.HORIZONTAL)
+            for e in REACTIONS[r0:r0 + 4]:
+                cell = FL(ctx)
+                cell.setBackground(u.ripple(u.shape("#00000000", oval=True), oval=True))
+                cell.setClickable(True)
+                cell.addView(u.emoji(e, 36), FL.LayoutParams(dp(34), dp(34), G.CENTER))
+                cell.setOnClickListener(OnClickListener(lambda v, e=e: self.p.run_safe(lambda: self.pick_reaction(e))))
+                u.press(cell)
+                line.addView(cell, LL.LayoutParams(dp(48), dp(48)))
+                self.react_cells.append(cell)
+            self.react_bar.addView(line)
+        rlp = FL.LayoutParams(-2, -2, G.BOTTOM | G.END)
+        rlp.rightMargin = dp(66)
+        rlp.bottomMargin = dp(150)
         self.root.addView(self.react_bar, rlp)
         self.react_bar.setVisibility(8)
 
-        # чат сбоку, как в стримах
+        # чат, как в стримах
         self.build_chat()
 
         # нижняя «пилюля»
         self.bottom = LL(ctx)
         self.bottom.setOrientation(LL.VERTICAL)
-        self.bottom.setPadding(dp(14), dp(8), dp(10), dp(8))
-        self.bottom.setBackground(u.shape("#E61C1C1E", dp(28)))
+        self.bottom.setPadding(dp(16), dp(6), dp(16), dp(8))
+        self.bottom.setBackground(u.shape("#F01C1C1E", dp(28)))
         self.bottom.setClickable(True)
         row = LL(ctx)
         row.setOrientation(LL.HORIZONTAL)
@@ -1409,25 +1574,25 @@ class Player:
         self.bottom.addView(row, LL.LayoutParams(-1, -2))
         self.controls = LL(ctx)
         self.controls.setOrientation(LL.HORIZONTAL)
-        self.controls.setGravity(G.CENTER_VERTICAL)
-        self.bottom.addView(self.controls, LL.LayoutParams(-1, dp(52)))
+        self.controls.setGravity(G.CENTER)
+        self.bottom.addView(self.controls, LL.LayoutParams(-1, dp(60)))
         blp2 = FL.LayoutParams(-1, -2, G.BOTTOM)
         blp2.leftMargin = blp2.rightMargin = dp(12)
-        blp2.bottomMargin = dp(16)
+        blp2.bottomMargin = dp(14)
         self.root.addView(self.bottom, blp2)
         self.rebuild_controls()
 
-        # громкость/яркость
+        # громкость и яркость
         self.side = LL(ctx)
         self.side.setOrientation(LL.VERTICAL)
         self.side.setGravity(G.CENTER_HORIZONTAL)
-        self.side.setPadding(dp(10), dp(12), dp(10), dp(12))
-        self.side.setBackground(u.shape("#B31C1C1E", dp(22)))
+        self.side.setPadding(dp(12), dp(12), dp(12), dp(12))
+        self.side.setBackground(u.shape("#CC1C1C1E", dp(22)))
         self.side_icon = FL(ctx)
-        self.side.addView(self.side_icon, LL.LayoutParams(dp(24), dp(24)))
+        self.side.addView(self.side_icon, LL.LayoutParams(dp(26), dp(26)))
         self.side_text = u.text("", 13.0, True)
         self.side_text.setGravity(G.CENTER)
-        self.side.addView(self.side_text, LL.LayoutParams(-2, -2))
+        self.side.addView(self.side_text, self.lp_top(-2, -2, 4))
         self.root.addView(self.side, FL.LayoutParams(-2, -2, G.CENTER))
         self.side.setAlpha(0.0)
 
@@ -1435,13 +1600,14 @@ class Player:
         self.mini_bar = LL(ctx)
         self.mini_bar.setOrientation(LL.HORIZONTAL)
         self.mini_bar.addView(u.icon_button("expand", "⤢", 34, self.exit_mini, "#99000000", 18), LL.LayoutParams(dp(34), dp(34)))
-        sp = LL.LayoutParams(0, 1, 1.0)
-        self.mini_bar.addView(u.TV(ctx), sp)
+        self.mini_bar.addView(u.TV(ctx), LL.LayoutParams(0, 1, 1.0))
         self.mini_bar.addView(u.icon_button("close", "✕", 34, self.p.ask_close, "#99000000", 18), LL.LayoutParams(dp(34), dp(34)))
         mlp = FL.LayoutParams(-1, -2, G.TOP)
         mlp.leftMargin = mlp.rightMargin = mlp.topMargin = dp(6)
         self.root.addView(self.mini_bar, mlp)
         self.mini_bar.setVisibility(8)
+
+        self.intro()
 
     def build_chat(self):
         u, dp = self.u, self.u.dp
@@ -1450,13 +1616,18 @@ class Player:
         from android.widget import ScrollView, EditText
         self.chat = LL(ctx)
         self.chat.setOrientation(LL.VERTICAL)
-        self.chat.setPadding(dp(12), dp(10), dp(10), dp(10))
-        self.chat.setBackground(u.shape("#D91C1C1E", dp(22)))
+        self.chat.setPadding(dp(14), dp(10), dp(10), dp(10))
+        self.chat.setBackground(u.shape("#E61C1C1E", dp(22)))
         self.chat.setClickable(True)
         head = LL(ctx)
         head.setOrientation(LL.HORIZONTAL)
         head.setGravity(G.CENTER_VERTICAL)
-        head.addView(u.text("Чат", 15.0, True), LL.LayoutParams(0, -2, 1.0))
+        hi = u.icon("chat", "", 18, u.accent)
+        head.addView(hi, LL.LayoutParams(dp(18), dp(18)))
+        title = u.text("Чат комнаты", 15.0, True)
+        tl = LL.LayoutParams(0, -2, 1.0)
+        tl.leftMargin = dp(8)
+        head.addView(title, tl)
         head.addView(u.icon_button("close", "✕", 30, self.toggle_chat, "#00000000", 18), LL.LayoutParams(dp(30), dp(30)))
         self.chat.addView(head, LL.LayoutParams(-1, -2))
         self.chat_scroll = ScrollView(ctx)
@@ -1473,8 +1644,8 @@ class Player:
         self.input.setHintTextColor(u.c("#80FFFFFF"))
         self.input.setTextSize(14.0)
         self.input.setSingleLine(True)
-        self.input.setPadding(dp(14), dp(8), dp(14), dp(8))
-        self.input.setBackground(u.shape("#26FFFFFF", dp(18)))
+        self.input.setPadding(dp(14), dp(9), dp(14), dp(9))
+        self.input.setBackground(u.shape("#26FFFFFF", dp(19)))
         say.addView(self.input, LL.LayoutParams(0, -2, 1.0))
         slp = LL.LayoutParams(dp(38), dp(38))
         slp.leftMargin = dp(6)
@@ -1482,53 +1653,80 @@ class Player:
         sylp = LL.LayoutParams(-1, -2)
         sylp.topMargin = dp(8)
         self.chat.addView(say, sylp)
-        clp = FL.LayoutParams(dp(300), -1, G.END)
-        clp.topMargin = dp(88)
-        clp.bottomMargin = dp(140)
-        clp.rightMargin = dp(10)
+        clp = FL.LayoutParams(-1, dp(320), G.BOTTOM)
+        clp.leftMargin = dp(12)
+        clp.rightMargin = dp(68)
+        clp.bottomMargin = dp(142)
         self.root.addView(self.chat, clp)
         self.chat.setVisibility(8)
 
+    def intro(self):
+        """Панели плавно въезжают при открытии плеера."""
+        dp = self.u.dp
+        from android.view.animation import DecelerateInterpolator, OvershootInterpolator
+        self.top.setTranslationY(float(-dp(30)))
+        self.top.setAlpha(0.0)
+        self.top.animate().translationY(0.0).alpha(1.0).setDuration(320).setInterpolator(DecelerateInterpolator()).start()
+        self.bottom.setTranslationY(float(dp(60)))
+        self.bottom.setAlpha(0.0)
+        self.bottom.animate().translationY(0.0).alpha(1.0).setDuration(380).setInterpolator(DecelerateInterpolator()).start()
+        for i, b in enumerate((self.btn_chat, self.btn_react, self.btn_more)):
+            b.setScaleX(0.0)
+            b.setScaleY(0.0)
+            b.animate().scaleX(1.0).scaleY(1.0).setStartDelay(180 + i * 70).setDuration(320) \
+                .setInterpolator(OvershootInterpolator(2.0)).start()
+
     def rebuild_controls(self):
-        """Кнопки зависят от роли — пересобираем при передаче управления."""
+        """Нижние кнопки зависят от роли — пересобираем при передаче управления."""
         u, dp = self.u, self.u.dp
-        LL = u.LL
+        LL, G = u.LL, u.Gravity
         p = self.p
         host = p.is_host()
         c = self.controls
         c.removeAllViews()
         self.btn_play = None
         self.btn_speed = None
+        self._shown_playing = None
 
-        def add(view, size, gap=4):
+        def add(view, size, gap=6):
             lp = LL.LayoutParams(dp(size), dp(size))
             lp.leftMargin = lp.rightMargin = dp(gap)
             c.addView(view, lp)
 
         if host:
-            add(u.seek_button(True, lambda: p.run_safe(lambda: p.host_skip(-SKIP_MS))), 44)
-            self.btn_play = u.icon_button("play", "▶", 52, lambda: p.run_safe(p.host_toggle), u.accent, 28)
-            add(self.btn_play, 52)
-            add(u.seek_button(False, lambda: p.run_safe(lambda: p.host_skip(SKIP_MS))), 44)
-        else:
-            add(u.icon_button("hand", "✋", 44, lambda: p.run_safe(p.ask_wait), "#26FFFFFF", 22), 44)
-            add(u.icon_button("retry", "⟳", 44, lambda: p.run_safe(p.catch_up), "#26FFFFFF", 22), 44)
-        c.addView(u.TV(self.act), LL.LayoutParams(0, 1, 1.0))
-        if host:
-            self.btn_speed = u.text("1×", 14.0, True)
-            self.btn_speed.setGravity(u.Gravity.CENTER)
+            self.btn_speed = u.text(f"{self.speed:g}×", 14.0, True)
+            self.btn_speed.setGravity(G.CENTER)
             self.btn_speed.setBackground(u.ripple(u.shape("#26FFFFFF", oval=True), oval=True))
             self.btn_speed.setClickable(True)
             self.btn_speed.setOnClickListener(OnClickListener(lambda v: p.run_safe(p.host_speed)))
-            add(self.btn_speed, 40, 3)
-        add(u.icon_button("react", "😊", 40, self.toggle_reactions, "#26FFFFFF", 22), 40, 3)
-        self.btn_chat = u.icon_button("chat", "💬", 40, self.toggle_chat, "#26FFFFFF", 22, badge=True)
-        self.chat_badge = u.last_badge
-        add(self.btn_chat, 40, 3)
-        add(u.icon_button("more", "⋯", 40, lambda: p.run_safe(p.open_more), "#26FFFFFF", 22), 40, 3)
+            u.press(self.btn_speed)
+            add(self.btn_speed, 40)
+            add(u.seek_button(True, lambda: p.run_safe(lambda: p.host_skip(-SKIP_MS))), 46)
+            self.btn_play = u.icon_button("play", "▶", 58, lambda: p.run_safe(p.host_toggle), u.accent, 30)
+            add(self.btn_play, 58, 8)
+            add(u.seek_button(False, lambda: p.run_safe(lambda: p.host_skip(SKIP_MS))), 46)
+            add(u.icon_button("pip", "▣", 40, lambda: p.run_safe(self.enter_mini), "#26FFFFFF", 22), 40)
+        else:
+            add(u.icon_button("hand", "✋", 46, lambda: p.run_safe(p.ask_wait), "#26FFFFFF", 24), 46)
+            lock = LL(self.act)
+            lock.setOrientation(LL.HORIZONTAL)
+            lock.setGravity(G.CENTER)
+            lock.setPadding(dp(12), dp(8), dp(14), dp(8))
+            lock.setBackground(u.shape("#1AFFFFFF", dp(18)))
+            lock.addView(u.icon("lock", "", 16, "#B3FFFFFF"), LL.LayoutParams(dp(16), dp(16)))
+            self.lock_text = u.text(f"Управляет {p.host_name()}", 13.0, True, "#CCFFFFFF")
+            self.lock_text.setSingleLine(True)
+            self.lock_text.setEllipsize(_ellipsize())
+            ltl = LL.LayoutParams(-2, -2)
+            ltl.leftMargin = dp(6)
+            lock.addView(self.lock_text, ltl)
+            llp = LL.LayoutParams(0, -2, 1.0)
+            llp.leftMargin = llp.rightMargin = dp(6)
+            c.addView(lock, llp)
+            add(u.icon_button("retry", "⟳", 46, lambda: p.run_safe(p.catch_up), "#26FFFFFF", 24), 46)
         try:
             self.seek.setEnabled(host)
-            self.seek.setAlpha(1.0 if host else 0.6)
+            self.seek.setAlpha(1.0 if host else 0.55)
         except Exception:
             pass
 
@@ -1610,12 +1808,20 @@ class Player:
         c.setBackground(u.shape("#F01C1C1E", dp(24)))
         c.setPadding(dp(20), dp(20), dp(20), dp(20))
         if kind == "loading":
-            c.addView(self.centered(text, 16.0, "#FFFFFFFF", True), LL.LayoutParams(-1, -2))
+            if pc is None:
+                from android.widget import ProgressBar
+                spin = ProgressBar(self.act)
+                try:
+                    spin.setIndeterminateTintList(u.CSL.valueOf(u.c(u.accent)))
+                except Exception:
+                    pass
+                c.addView(spin, LL.LayoutParams(dp(36), dp(36)))
+            c.addView(self.centered(text, 16.0, "#FFFFFFFF", True), self.lp_top(-1, -2, 10 if pc is None else 0))
             if pc is not None:
                 c.addView(self.progress(pc), self.lp_top(-1, dp(6), 14))
         elif kind == "error":
-            c.addView(self.centered("⚠️", 34.0), LL.LayoutParams(-1, -2))
-            c.addView(self.centered(text, 15.0, "#FFFFFFFF"), self.lp_top(-1, -2, 8))
+            c.addView(u.icon("warning", "!", 40, "#FFFF9F0A"), LL.LayoutParams(dp(40), dp(40)))
+            c.addView(self.centered(text, 15.0, "#FFFFFFFF"), self.lp_top(-1, -2, 10))
         elif kind == "waiting":
             if people:
                 c.addView(u.avatar(people[0], people[1], 56, crown=True), LL.LayoutParams(dp(56), dp(56)))
@@ -1633,17 +1839,45 @@ class Player:
             gap.leftMargin = dp(8)
             btns.addView(u.pill_button("Пригласить", lambda: self.p.run_safe(self.p.share_code), "#33FFFFFF", "share", 14.0), gap)
             c.addView(btns, self.lp_top(-2, -2, 12))
-            for user, name, status, frac, dot in rows or []:
-                c.addView(self.member_row(user, name, status, frac, dot), self.lp_top(-1, -2, 12))
+            for i, (user, name, status, frac, dot) in enumerate(rows or []):
+                r = self.member_row(user, name, status, frac, dot)
+                c.addView(r, self.lp_top(-1, -2, 12))
+                r.setAlpha(0.0)
+                r.setTranslationX(float(dp(24)))
+                r.animate().alpha(1.0).translationX(0.0).setStartDelay(60 * i).setDuration(260).start()
             if not rows:
-                c.addView(u.text("Пока никого. Отправь код другу.", 14.0, False, "#B3FFFFFF"), self.lp_top(-2, -2, 14))
+                empty = LL(self.act)
+                empty.setOrientation(LL.HORIZONTAL)
+                empty.setGravity(G.CENTER_VERTICAL)
+                empty.addView(u.icon("join", "", 20, "#99FFFFFF"), LL.LayoutParams(dp(20), dp(20)))
+                et = u.text("Пока никого — отправь приглашение", 14.0, False, "#B3FFFFFF")
+                el = LL.LayoutParams(-2, -2)
+                el.leftMargin = dp(10)
+                empty.addView(et, el)
+                c.addView(empty, self.lp_top(-2, -2, 16))
             start = u.pill_button("Начать для всех", lambda: self.p.run_safe(self.p.host_start), u.accent, "play", 16.0)
             c.addView(start, self.lp_top(-1, -2, 18))
+            self.breathe(start, any(d == ONLINE for *_, d in (rows or [])))
         c.setGravity(G.CENTER_HORIZONTAL if kind != "lobby" else G.START)
         if prev_kind != kind:
             c.setAlpha(0.0)
             c.setTranslationY(float(dp(12)))
             c.animate().alpha(1.0).translationY(0.0).setDuration(220).start()
+
+    def breathe(self, view, on):
+        """Кнопка «Начать» мягко пульсирует, когда кто-то уже готов."""
+        token = object()
+        self._breath = token
+        if not on:
+            return
+
+        def step(up):
+            if not self.alive or self._breath is not token or not view.isAttachedToWindow():
+                return
+            k = 1.045 if up else 1.0
+            view.animate().scaleX(k).scaleY(k).setDuration(800).start()
+            run_on_ui_thread(lambda: step(not up), 820)
+        step(True)
 
     def centered(self, s, size, color="#FFFFFFFF", bold=False):
         t = self.u.text(s, size, bold, color)
@@ -1708,26 +1942,35 @@ class Player:
         clp.leftMargin = dp(6)
         self.faces.addView(cnt, clp)
 
-    def show_banner(self, text, action=None, fn=None, seconds=6):
+    def show_banner(self, text, action=None, fn=None, seconds=5, icon=None):
         u, dp = self.u, self.u.dp
         b = self.banner
         b.removeAllViews()
-        b.addView(u.text(text, 14.0, True))
+        b.setPadding(dp(12), dp(8), dp(8) if action else dp(16), dp(8))
+        if icon:
+            b.addView(u.icon(icon, "", 20, u.accent), u.LL.LayoutParams(dp(20), dp(20)))
+        t = u.text(text, 14.0, True)
+        tl = u.LL.LayoutParams(-2, -2)
+        tl.leftMargin = dp(8) if icon else dp(4)
+        b.addView(t, tl)
         if action:
             btn = u.text(action, 13.0, True)
             btn.setPadding(dp(12), dp(6), dp(12), dp(6))
             btn.setBackground(u.ripple(u.shape(u.accent, dp(14)), radius=dp(14)))
             btn.setClickable(True)
             btn.setOnClickListener(OnClickListener(lambda v: (self.hide_banner(), self.p.run_safe(fn))))
+            u.press(btn)
             lp = u.LL.LayoutParams(-2, -2)
             lp.leftMargin = dp(10)
             b.addView(btn, lp)
-        else:
-            b.setPadding(dp(14), dp(9), dp(14), dp(9))
+        from android.view.animation import OvershootInterpolator
         b.setVisibility(0)
         b.setAlpha(0.0)
-        b.setTranslationY(float(-dp(10)))
-        b.animate().alpha(1.0).translationY(0.0).setDuration(200).start()
+        b.setScaleX(0.9)
+        b.setScaleY(0.9)
+        b.setTranslationY(float(-dp(14)))
+        b.animate().alpha(1.0).scaleX(1.0).scaleY(1.0).translationY(0.0).setDuration(300) \
+            .setInterpolator(OvershootInterpolator(1.6)).start()
         self.banner_id = getattr(self, "banner_id", 0) + 1
         bid = self.banner_id
         run_on_ui_thread(lambda: self.hide_banner() if self.banner_id == bid else None, seconds * 1000)
@@ -1763,10 +2006,17 @@ class Player:
         u = self.u
         old = button.getTag()
         if old is not None:
-            button.removeView(old)
-        ic = u.icon(key, fallback, 28)
-        button.addView(ic, u.FL.LayoutParams(u.dp(28), u.dp(28), u.Gravity.CENTER))
+            old.animate().scaleX(0.0).scaleY(0.0).rotation(-90.0).setDuration(140).start()
+            run_on_ui_thread(lambda: button.removeView(old), 150)
+        ic = u.icon(key, fallback, 30)
+        button.addView(ic, u.FL.LayoutParams(u.dp(30), u.dp(30), u.Gravity.CENTER))
         button.setTag(ic)
+        ic.setScaleX(0.0)
+        ic.setScaleY(0.0)
+        ic.setRotation(90.0)
+        from android.view.animation import OvershootInterpolator
+        ic.animate().scaleX(1.0).scaleY(1.0).rotation(0.0).setStartDelay(80).setDuration(300) \
+            .setInterpolator(OvershootInterpolator(2.2)).start()
 
     def set_speed_label(self, x):
         if self.btn_speed is not None:
@@ -1816,7 +2066,8 @@ class Player:
                 delta = int(dx / w * min(self.duration, 180000))
                 target = max(0, min(self.duration, t["pos"] + delta))
                 t["target"] = target
-                self.flash(f"{fmt_time(target)}  ({'+' if delta >= 0 else '−'}{abs(delta) // 1000} с)", keep=True)
+                self.flash(f"{fmt_time(target)}  {'+' if delta >= 0 else '−'}{abs(delta) // 1000} с", keep=True,
+                           icon="timer")
             elif m == "vol":
                 self.set_volume(t["vol"] - dy / h * 1.4)
             elif m == "br":
@@ -1846,10 +2097,10 @@ class Player:
                 self.locked_hint()
             elif third < 0.33:
                 self.p.host_skip(-SKIP_MS)
-                self.flash("⟲  −10 с")
+                self.flash("−10 с", icon="retry")
             elif third > 0.66:
                 self.p.host_skip(SKIP_MS)
-                self.flash("+10 с  ⟳")
+                self.flash("+10 с", icon="retry")
             else:
                 self.p.host_toggle()
             return
@@ -1859,12 +2110,21 @@ class Player:
         run_on_ui_thread(lambda: self.toggle_ui() if self.tap_seq == seq else None, 310)
 
     def locked_hint(self):
-        self.flash(f"🔒 Управляет {self.p.host_name()}")
+        self.flash(f"Управляет {self.p.host_name()}", icon="lock")
 
-    def flash(self, text, keep=False):
-        self.hint.setText(text)
+    def flash(self, text, keep=False, icon=None):
+        u = self.u
+        self.hint_icon.removeAllViews()
+        if icon:
+            self.hint_icon.addView(u.icon(icon, "", 22), u.FL.LayoutParams(-1, -1))
+            self.hint_icon.setVisibility(0)
+        else:
+            self.hint_icon.setVisibility(8)
+        self.hint_text.setText(text)
         self.hint.animate().cancel()
         self.hint.setAlpha(1.0)
+        self.hint.setScaleX(1.0)
+        self.hint.setScaleY(1.0)
         if not keep:
             self.hint.animate().alpha(0.0).setStartDelay(700).setDuration(300).start()
 
@@ -1888,7 +2148,7 @@ class Player:
             a.setStreamVolume(3, int(round(f * a.getStreamMaxVolume(3))), 0)
         except Exception as e:
             self.p.log_err(f"громкость: {e}")
-        self.show_side("volume", "🔊", f)
+        self.show_side("volume", "♪", f)
 
     def brightness(self):
         try:
@@ -1906,7 +2166,7 @@ class Player:
             w.setAttributes(lp)
         except Exception as e:
             self.p.log_err(f"яркость: {e}")
-        self.show_side("bright", "☀️", f)
+        self.show_side("bright", "☼", f)
 
     def show_side(self, key, fallback, f):
         u = self.u
@@ -1922,29 +2182,48 @@ class Player:
 
     def toggle_ui(self):
         self.ui_shown = not self.ui_shown
-        a = 1.0 if self.ui_shown else 0.0
-        for v in (self.top, self.bottom):
+        dp = self.u.dp
+        shown = self.ui_shown
+        a = 1.0 if shown else 0.0
+        moves = ((self.top, -dp(24)), (self.bottom, dp(40)), (self.col, 0))
+        for v, dy in moves:
             v.setVisibility(0)
-            v.animate().alpha(a).setDuration(200).start()
-        if not self.ui_shown:
+            v.animate().alpha(a).translationY(0.0 if shown else float(dy)).setDuration(220).start()
+        if not shown:
             self.react_bar.setVisibility(8)
 
             def hide():
                 if not self.ui_shown:
-                    self.top.setVisibility(4)
-                    self.bottom.setVisibility(4)
-            run_on_ui_thread(hide, 220)
+                    for v, _ in moves:
+                        v.setVisibility(4)
+            run_on_ui_thread(hide, 230)
 
     def toggle_reactions(self):
         rb = self.react_bar
         if rb.getVisibility() == 0:
-            rb.setVisibility(8)
+            rb.animate().alpha(0.0).scaleX(0.85).scaleY(0.85).setDuration(150).start()
+            run_on_ui_thread(lambda: rb.setVisibility(8), 160)
             return
+        from android.view.animation import OvershootInterpolator
+        rb.setPivotX(float(rb.getWidth() or self.u.dp(200)))
+        rb.setPivotY(float(rb.getHeight() or self.u.dp(110)))
         rb.setVisibility(0)
-        rb.setScaleX(0.8)
-        rb.setScaleY(0.8)
+        rb.setScaleX(0.6)
+        rb.setScaleY(0.6)
         rb.setAlpha(0.0)
-        rb.animate().scaleX(1.0).scaleY(1.0).alpha(1.0).setDuration(180).start()
+        rb.animate().scaleX(1.0).scaleY(1.0).alpha(1.0).setDuration(260).setInterpolator(OvershootInterpolator(1.4)).start()
+        for i, cell in enumerate(self.react_cells):
+            cell.setScaleX(0.0)
+            cell.setScaleY(0.0)
+            cell.animate().scaleX(1.0).scaleY(1.0).setStartDelay(40 + i * 28).setDuration(260) \
+                .setInterpolator(OvershootInterpolator(2.5)).start()
+
+    def pick_reaction(self, e):
+        self.p.send_reaction(e)
+        self.toggle_reactions()
+        heart = self.btn_react
+        heart.animate().scaleX(1.25).scaleY(1.25).setStartDelay(0).setDuration(120).start()
+        run_on_ui_thread(lambda: heart.animate().scaleX(1.0).scaleY(1.0).setDuration(200).start(), 130)
 
     def toggle_chat(self):
         self.chat_open = not self.chat_open
@@ -1953,7 +2232,7 @@ class Player:
             ch.setVisibility(0)
             ch.setTranslationX(float(self.u.dp(40)))
             ch.setAlpha(0.0)
-            ch.animate().translationX(0.0).alpha(1.0).setDuration(220).start()
+            ch.animate().translationX(0.0).alpha(1.0).setDuration(240).start()
             self.feed.setVisibility(8)
             self.unread = 0
             self.update_badge()
@@ -1973,8 +2252,13 @@ class Player:
         if b is None:
             return
         if self.unread:
+            first = b.getVisibility() != 0
             b.setText(str(min(self.unread, 99)))
             b.setVisibility(0)
+            from android.view.animation import OvershootInterpolator
+            b.setScaleX(0.3 if first else 1.3)
+            b.setScaleY(0.3 if first else 1.3)
+            b.animate().scaleX(1.0).scaleY(1.0).setDuration(280).setInterpolator(OvershootInterpolator(2.5)).start()
         else:
             b.setVisibility(8)
 
@@ -2032,28 +2316,36 @@ class Player:
         run_on_ui_thread(fade, 7000)
 
     def fly(self, emoji, who):
-        """Реакция вылетает снизу справа и тает."""
+        """Реакция взлетает по дуге от кнопки справа, покачиваясь, и тает."""
         if not self.alive:
             return
         u, dp = self.u, self.u.dp
+        from android.view.animation import DecelerateInterpolator
         box = u.LL(self.act)
         box.setOrientation(u.LL.VERTICAL)
         box.setGravity(u.Gravity.CENTER_HORIZONTAL)
-        box.addView(u.text(emoji, 34.0))
+        size = random.randint(40, 54)
+        box.addView(u.emoji(emoji, size), u.LL.LayoutParams(dp(size), dp(size)))
         if who:
             n = u.text(who, 11.0, True)
-            n.setShadowLayer(dp(3), 0.0, 0.0, u.c("#CC000000"))
+            n.setShadowLayer(float(dp(3)), 0.0, 0.0, u.c("#CC000000"))
             box.addView(n)
         lp = u.FL.LayoutParams(-2, -2, u.Gravity.BOTTOM | u.Gravity.END)
-        lp.rightMargin = dp(24 + random.randint(0, 70))
-        lp.bottomMargin = dp(150)
+        lp.rightMargin = dp(14 + random.randint(0, 30))
+        lp.bottomMargin = dp(200)
         self.fx.addView(box, lp)
-        box.setScaleX(0.4)
-        box.setScaleY(0.4)
-        box.animate().translationY(float(-dp(320 + random.randint(0, 80)))) \
-            .translationX(float(dp(random.randint(-40, 40)))).scaleX(1.25).scaleY(1.25).alpha(0.0) \
-            .setDuration(2600).start()
-        run_on_ui_thread(lambda: self.fx.removeView(box), 2700)
+        box.setScaleX(0.2)
+        box.setScaleY(0.2)
+        box.setAlpha(0.0)
+        drift = float(-dp(random.randint(30, 120)))
+        box.animate().scaleX(1.0).scaleY(1.0).alpha(1.0).translationY(float(-dp(60))).setDuration(260).start()
+
+        def rise():
+            box.animate().translationY(float(-dp(random.randint(320, 420)))).translationX(drift) \
+                .rotation(float(random.randint(-25, 25))).alpha(0.0).scaleX(1.15).scaleY(1.15) \
+                .setDuration(2300).setInterpolator(DecelerateInterpolator(1.4)).start()
+        run_on_ui_thread(rise, 270)
+        run_on_ui_thread(lambda: self.fx.removeView(box), 2650)
 
     # ---------- мини-плеер ----------
 
@@ -2062,7 +2354,7 @@ class Player:
             return
         u, dp = self.u, self.u.dp
         self.mini = True
-        for v in (self.top, self.bottom, self.card, self.chat, self.feed, self.react_bar, self.banner):
+        for v in (self.top, self.bottom, self.card, self.chat, self.feed, self.react_bar, self.banner, self.col):
             v.setVisibility(8)
         self.mini_bar.setVisibility(0)
         try:
@@ -2082,7 +2374,7 @@ class Player:
         w.setAttributes(lp)
         w.addFlags(0x20 | 0x8)   # NOT_TOUCH_MODAL | NOT_FOCUSABLE — Telegram под плеером работает
         w.clearFlags(0x2)        # без затемнения
-        self.p.notify_user("Мини-плеер: перетаскивай, нажми — развернуть")
+        self.p.notify_user("Мини-плеер: перетаскивай, нажми — развернуть", "pip")
 
     def exit_mini(self):
         if not self.mini:
@@ -2097,10 +2389,9 @@ class Player:
         lp = w.getAttributes()
         lp.x = lp.y = 0
         w.setAttributes(lp)
-        self.top.setVisibility(0)
-        self.bottom.setVisibility(0)
-        self.top.setAlpha(1.0)
-        self.bottom.setAlpha(1.0)
+        for v in (self.top, self.bottom, self.col):
+            v.setVisibility(0)
+            v.setAlpha(1.0)
         self.ui_shown = True
         self.feed.setVisibility(0 if not self.chat_open else 8)
         if self.chat_open:
@@ -2274,6 +2565,7 @@ class WtogetherPlugin(BasePlugin):
                                             text="Wtogether", on_click=lambda ctx: self.open_panel()))
         except Exception as e:
             self.log_err(f"меню: {e}")
+        Emoji3D.prefetch(self.log_err)
         self.logger.info(f"Wtogether {__version__} загружен")
 
     def on_plugin_unload(self):
@@ -2313,10 +2605,10 @@ class WtogetherPlugin(BasePlugin):
         frag = get_last_fragment()
         return frag.getParentActivity() if frag else None
 
-    def notify_user(self, text):
+    def notify_user(self, text, icon="info"):
         pl = self.player
         if pl is not None and pl.alive and not pl.mini:
-            pl.show_banner(text)
+            pl.show_banner(text, icon=icon)
         elif self.get_setting("notify", True):
             BulletinHelper.show_info(text)
 
@@ -2612,7 +2904,7 @@ class WtogetherPlugin(BasePlugin):
                            "Просмотр в этой комнате уже закончился." if ended else
                            "Проверь код. Если код верный — у ведущего или у тебя нет интернета.")
         elif r.host_uid() not in r.members:
-            self.notify_user("Ведущий сейчас не в сети — ждём его")
+            self.notify_user("Ведущий сейчас не в сети — ждём его", "warning")
 
     def on_room(self, info):
         if not self.is_guest() or self.source is not None:
@@ -2716,7 +3008,7 @@ class WtogetherPlugin(BasePlugin):
     def on_completed(self):
         if self.is_host():
             self.publish_host_state()
-            self.notify_user("Видео закончилось")
+            self.notify_user("Видео закончилось", "check")
 
     def lobby_people(self):
         r = self.room
@@ -2775,7 +3067,7 @@ class WtogetherPlugin(BasePlugin):
         if not self.is_host() or pl is None:
             return
         if not pl.playing():
-            self.notify_user("Скорость меняется во время воспроизведения")
+            self.notify_user("Скорость меняется во время воспроизведения", "speed")
             return
         cur = pl.speed or 1.0
         nxt = SPEEDS[(SPEEDS.index(cur) + 1) % len(SPEEDS)] if cur in SPEEDS else 1.0
@@ -2789,15 +3081,15 @@ class WtogetherPlugin(BasePlugin):
         if pl is None or not pl.prepared:
             return
         if not pl.playing():
-            self.notify_user(f"✋ {n} просит подождать")
+            self.notify_user(f"{n} просит подождать", "hand")
             return
         if self.get_setting("auto_pause", True):
             pl.pause()
             self.publish_host_state()
-            self.notify_user(f"⏸ Пауза — {n} просит подождать")
+            self.notify_user(f"Пауза — {n} просит подождать", "hand")
         elif not pl.mini:
-            pl.show_banner(f"✋ {n} просит подождать", "Пауза",
-                           lambda: (pl.pause(), self.publish_host_state()), seconds=10)
+            pl.show_banner(f"{n} просит подождать", "Пауза",
+                           lambda: (pl.pause(), self.publish_host_state()), seconds=10, icon="hand")
 
     def transfer_control(self):
         r = self.room
@@ -2809,7 +3101,7 @@ class WtogetherPlugin(BasePlugin):
             return
         names = [r.members[u].get("n") or "?" for u in uids]
         self.pick("👑 Кому передать управление?", names,
-                  lambda i: (r.transfer(uids[i]), self.notify_user(f"👑 Управление у {names[i]}")))
+                  lambda i: (r.transfer(uids[i]), self.notify_user(f"Управление у {names[i]}", "crown")))
 
     # ---------- зритель ----------
 
@@ -2818,12 +3110,12 @@ class WtogetherPlugin(BasePlugin):
             self.room.ping()
             if self.player is not None:
                 self.player.seek_block_until = 0
-            self.notify_user("Догоняю ведущего…")
+            self.notify_user("Догоняю ведущего…", "retry")
 
     def ask_wait(self):
         if self.is_guest():
             self.room.ask_wait()
-            self.notify_user(f"✋ Попросил(а) {self.host_name()} подождать")
+            self.notify_user(f"Попросил(а) {self.host_name()} подождать", "hand")
 
     def on_end(self):
         hn = self.host_name()
@@ -2841,18 +3133,20 @@ class WtogetherPlugin(BasePlugin):
             st = self.room.st
             self.started = bool(st and (st["p"] or st["pos"] > 0))
             self.publish_host_state()
-            self.notify_user("👑 Теперь ведёшь ты")
+            self.notify_user("Теперь ведёшь ты", "crown")
         else:
             self.nudging = False
             self.last_ping = 0
-            self.notify_user(f"👑 Теперь ведёт {self.host_name()}")
+            self.notify_user(f"Теперь ведёт {self.host_name()}", "crown")
         if pl is not None and pl.alive:
             pl.rebuild_controls()
             pl.card_sig = None
         self.update_ui()
 
     def on_host_changed(self, uid):
-        self.notify_user(f"👑 Теперь ведёт {self.member_name(uid)}")
+        self.notify_user(f"Теперь ведёт {self.member_name(uid)}", "crown")
+        if self.player is not None and self.player.alive:
+            self.player.rebuild_controls()
         self.update_ui()
 
     # ---------- общение ----------
@@ -2862,11 +3156,11 @@ class WtogetherPlugin(BasePlugin):
         if r is None:
             return
         if joined:
-            self.notify_user(f"🟢 {self.member_name(joined)} в комнате")
+            self.notify_user(f"{self.member_name(joined)} в комнате", "join")
         if left:
-            self.notify_user("👋 Участник вышел")
+            self.notify_user("Участник вышел", "leave")
             if self.is_guest() and r.host_uid() == left:
-                self.notify_user("Ведущий отключился — ждём возвращения")
+                self.notify_user("Ведущий отключился — ждём возвращения", "warning")
         self.update_ui()
 
     def on_chat(self, msg):
@@ -2876,7 +3170,7 @@ class WtogetherPlugin(BasePlugin):
         if self.player is not None:
             self.player.add_message(who, x, False, at)
         else:
-            self.notify_user(f"💬 {who}: {x}")
+            self.notify_user(f"{who}: {x}", "chat")
 
     def on_react(self, msg):
         if self.player is not None and not self.player.mini:
@@ -3045,9 +3339,9 @@ class WtogetherPlugin(BasePlugin):
         link = r.status
         if self.is_host():
             ready = sum(1 for u, m in r.members.items() if u != r.uid and m.get("s") == "ready")
-            sub = (f"👑 ты ведёшь · готовы {ready} из {guests}" if guests else "👑 ты ведёшь · ждём зрителей")
+            sub = (f"ты ведёшь · готовы {ready} из {guests}" if guests else "ты ведёшь · ждём зрителей")
         else:
-            sub = f"👑 ведёт {self.host_name()} · {guests} зрит."
+            sub = f"ведёт {self.host_name()} · зрителей: {guests}"
         if link != "на связи":
             sub += f" · {link}"
         pl.set_titles(None, f"Комната {r.code} · {sub}" if r.claimed or self.is_guest() else "Создаю комнату…")
@@ -3206,12 +3500,20 @@ class WtogetherPlugin(BasePlugin):
             Divider(text="Плагин нужен у всех участников. В чат ничего не пишется — связь идёт отдельно"),
         ]
 
+    def emoji_count(self):
+        import os
+        try:
+            return sum(1 for e in EMOJI_3D if os.path.exists(Emoji3D.path(e)))
+        except Exception:
+            return 0
+
     def diagnostics(self):
         r = self.room
         lines = [f"Версия {__version__}",
                  f"Приём приглашений: {'да' if self.nc_delegate else 'только хук'}",
                  f"Вход по ссылке: {'да' if self.link_hooks else 'нет'} ({self.link_hooks})",
-                 "Нет иконок: " + (", ".join(sorted(UI.missing)) or "все на месте")]
+                 "Нет иконок: " + (", ".join(sorted(UI.missing)) or "все на месте"),
+                 f"3D-эмодзи: {self.emoji_count()} из {len(EMOJI_3D)}"]
         if r is not None:
             c = r.client
             lines += [f"Комната: {r.code} ({r.role}, {'занята' if r.claimed else 'не занята'})",

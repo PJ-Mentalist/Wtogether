@@ -22,7 +22,7 @@ import time
 
 from base_plugin import BasePlugin, HookResult, HookStrategy, MenuItemData, MenuItemType
 from client_utils import (send_request, send_text, get_messages_controller, get_last_fragment,
-                          get_file_loader, NotificationCenterDelegate, get_notification_center)
+                          get_file_loader, get_notification_center)
 from android_utils import run_on_ui_thread, OnClickListener, copy_to_clipboard
 from ui.bulletin import BulletinHelper
 from ui.alert import AlertDialogBuilder
@@ -36,7 +36,7 @@ __id__ = "wtogether"
 __name__ = "Wtogether"
 __description__ = "Совместный просмотр видео в своём плеере: ведущий управляет, у всех синхронно, лобби, чат и звонок"
 __author__ = "Wtogether"
-__version__ = "2.0.0"
+__version__ = "2.0.1"
 # Иконка: имя_набора_стикеров/номер. После создания своего набора через @Stickers замени на "ИмяНабора/0"
 __icon__ = "exteraPlugins/1"
 __category__ = ["media", "chats"]
@@ -219,16 +219,21 @@ def listeners():
     return listeners.cache
 
 
-class NewMessages(NotificationCenterDelegate):
-    """Запасной путь приёма команд — если хук обновлений не сработал."""
-    plugin = None
+def make_new_messages_observer(plugin):
+    """Запасной путь приёма команд — если хук обновлений не сработал.
+    Класс создаётся внутри функции: если что-то пойдёт не так, плагин всё равно загрузится."""
+    class NewMessages(dynamic_proxy(NotificationCenter.NotificationCenterDelegate)):
+        def __init__(self):
+            super().__init__()
 
-    def didReceivedNotification(self, id, account, args):
-        try:
-            if id == NotificationCenter.didReceiveNewMessages:
-                self.plugin.on_new_messages(int(args[0]), args[1])
-        except Exception as e:
-            self.plugin.err(f"didReceiveNewMessages: {e}")
+        def didReceivedNotification(self, id, account, args):
+            try:
+                if id == NotificationCenter.didReceiveNewMessages:
+                    plugin.on_new_messages(int(args[0]), args[1])
+            except Exception as e:
+                plugin.err(f"didReceiveNewMessages: {e}")
+
+    return NewMessages()
 
 
 # ---------------- плеер ----------------
@@ -776,8 +781,7 @@ class WtogetherPlugin(BasePlugin):
         self.add_hook("TL_updateNewMessage")
         self.add_hook("TL_updateShortMessage")
         try:
-            NewMessages.plugin = self
-            self.nc_delegate = NewMessages()
+            self.nc_delegate = make_new_messages_observer(self)
             get_notification_center().addObserver(self.nc_delegate, NotificationCenter.didReceiveNewMessages)
         except Exception as e:
             self.nc_delegate = None

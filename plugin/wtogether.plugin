@@ -2,10 +2,11 @@
 Wtogether для exteraGram: совместный просмотр видео из личного чата.
 
 Как работает:
-1. Долгое нажатие на видео в личке → «Смотреть вместе». Другу уходит приглашение.
-2. Оба открываете это видео. Пауза, перемотка и скорость становятся общими.
-3. Команды идут тихими служебными сообщениями: у друга они скрываются,
-   а у отправителя удаляются с сервера через несколько секунд.
+1. Долгое нажатие на видео в личке → Плагины → «Смотреть вместе». Другу уходит приглашение.
+2. У друга появляется окно «Принять / Отказаться».
+3. Оба открываете это видео. Пауза, перемотка и скорость становятся общими.
+4. Меню чата (⋮) → «Wtogether» — панель: статус, синхронизация, завершение.
+Служебные команды идут тихими сообщениями: у друга скрываются, у отправителя удаляются.
 Плагин должен стоять у обоих.
 """
 import json
@@ -16,10 +17,11 @@ import time
 
 from base_plugin import BasePlugin, HookResult, HookStrategy, MenuItemData, MenuItemType, MethodHook
 from hook_utils import find_class, get_private_field
-from client_utils import send_request, send_text, get_messages_controller
+from client_utils import send_request, send_text, get_messages_controller, get_last_fragment
 from android_utils import run_on_ui_thread
 from ui.bulletin import BulletinHelper
-from ui.settings import Header, Switch, Text
+from ui.alert import AlertDialogBuilder
+from ui.settings import Header, Switch, Text, Divider
 from java.lang import Integer, Long
 from org.telegram.tgnet import TLRPC
 from org.telegram.messenger import MessageObject
@@ -28,12 +30,15 @@ __id__ = "wtogether"
 __name__ = "Wtogether"
 __description__ = "Смотрите видео из личного чата вместе: пауза, перемотка и скорость общие у обоих"
 __author__ = "Wtogether"
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __icon__ = "exteraPlugins/1"
 __category__ = ["media", "chats"]
 
 TAG = "#wt1 "
 TAG_RE = re.compile(r"#wt1 (\{.*\})", re.S)
+# невидимая метка: команда кодируется символами нулевой ширины, текст остаётся чистым
+ZW0, ZW1, ZWM = "​", "‌", "⁣"
+
 SEND_DELAY = 0.45      # с: склеиваем частые события (перетаскивание ползунка) в одну команду
 QUIET = 1.5            # с: после применения команды друга не отправляем «эхо»
 DRIFT_MS = 700         # расхождение, после которого перематываем
@@ -49,6 +54,45 @@ def fmt_time(ms):
     h, s = divmod(s, 3600)
     m, s = divmod(s, 60)
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def zw_encode(obj):
+    raw = json.dumps(obj, separators=(",", ":")).encode("utf-8")
+    return ZWM + "".join(ZW1 if bit == "1" else ZW0 for b in raw for bit in f"{b:08b}") + ZWM
+
+
+def zw_decode(text):
+    i = text.find(ZWM)
+    j = text.find(ZWM, i + 1) if i >= 0 else -1
+    if i < 0 or j < 0:
+        return None
+    bits = "".join("1" if c == ZW1 else "0" for c in text[i + 1:j] if c in (ZW0, ZW1))
+    if not bits or len(bits) % 8:
+        return None
+    try:
+        return json.loads(bytes(int(bits[k:k + 8], 2) for k in range(0, len(bits), 8)).decode("utf-8"))
+    except Exception:
+        return None
+
+
+def extract_cmd(text):
+    if not text:
+        return None
+    if ZWM in text:
+        cmd = zw_decode(text)
+        if cmd:
+            return cmd
+    m = TAG_RE.search(text)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except Exception:
+            return None
+    return None
+
+
+def has_cmd(text):
+    return bool(text) and (ZWM in text or TAG in text)
 
 
 class PlayerHook(MethodHook):
@@ -68,8 +112,10 @@ class WtogetherPlugin(BasePlugin):
     # ---------- жизненный цикл ----------
 
     def on_plugin_load(self):
-        self.session = None      # {"dialog": id чата, "doc": id видеофайла}
+        # session: {"dialog", "doc", "accepted", "since", "friend_open"}
+        self.session = None
         self.remote = None       # последнее состояние от друга
+        self.remote_at = 0       # когда оно пришло (мс)
         self.bound = None        # плеер, который сейчас синхронизируем
         self.quiet_until = 0.0
         self.seq = 0
@@ -81,18 +127,13 @@ class WtogetherPlugin(BasePlugin):
 
         self.add_menu_item(MenuItemData(
             menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
-            text="Смотреть вместе",
+            text="🎬 Смотреть вместе",
             on_click=self.on_watch_click,
         ))
         self.add_menu_item(MenuItemData(
             menu_type=MenuItemType.CHAT_ACTION_MENU,
-            text="Wtogether: подтянуть друга ко мне",
-            on_click=self.on_resync_click,
-        ))
-        self.add_menu_item(MenuItemData(
-            menu_type=MenuItemType.CHAT_ACTION_MENU,
-            text="Wtogether: закончить просмотр",
-            on_click=self.on_stop_click,
+            text="🎬 Wtogether",
+            on_click=lambda ctx: self.open_panel(),
         ))
 
         player_cls = find_class("org.telegram.ui.Components.VideoPlayer")
@@ -104,17 +145,115 @@ class WtogetherPlugin(BasePlugin):
             hooked += len(self.hook_all_methods(player_cls, name, PlayerHook(self, name)) or [])
         self.logger.info(f"Wtogether загружен, хуков плеера: {hooked}")
 
-    def create_settings(self):
-        return [
-            Header(text="Wtogether"),
-            Switch(key="notify", text="Показывать действия друга", default=True,
-                   subtext="Короткие уведомления: пауза, перемотка, подключение"),
-            Text(text="Как пользоваться",
-                 subtext="Долгое нажатие на видео в личке → «Смотреть вместе». "
-                         "Потом оба открывайте это видео. Плагин нужен у обоих."),
-        ]
+    # ---------- настройки и панель ----------
 
-    # ---------- меню ----------
+    def create_settings(self):
+        items = [Header(text="Сейчас")]
+        if self.session:
+            items.append(Text(text=self.status_title(), subtext=self.status_line(), icon="msg_info",
+                              on_click=lambda v: self.open_panel()))
+            items.append(Text(text="Закончить совместный просмотр", red=True,
+                              on_click=lambda v: self.stop_session(reload=True)))
+        else:
+            items.append(Text(text="Совместный просмотр не идёт",
+                              subtext="Долгое нажатие на видео в личке → Плагины → «Смотреть вместе»"))
+        items += [
+            Divider(),
+            Header(text="Уведомления"),
+            Switch(key="notify", text="Действия друга", default=True,
+                   subtext="Пауза, перемотка, подключение"),
+            Switch(key="ask_invite", text="Спрашивать перед подключением", default=True,
+                   subtext="Окно «Принять / Отказаться», когда друг зовёт смотреть"),
+            Divider(),
+            Header(text="Как пользоваться"),
+            Text(text="1. Позови друга",
+                 subtext="Долгое нажатие на видео в личке → Плагины → «Смотреть вместе»"),
+            Text(text="2. Откройте видео оба",
+                 subtext="Кто откроет позже, сам догонит позицию"),
+            Text(text="3. Управляйте вместе",
+                 subtext="Пауза, перемотка и скорость общие. Меню чата ⋮ → «Wtogether» — панель"),
+            Divider(text="Плагин нужен у обоих собеседников"),
+        ]
+        return items
+
+    def status_title(self):
+        if not self.session:
+            return "Совместный просмотр не идёт"
+        name = self.friend_name(self.session["dialog"])
+        return f"Смотришь вместе с {name}" if self.session.get("accepted") else f"Ждём ответа от {name}"
+
+    def status_line(self):
+        s = self.session
+        if not s:
+            return ""
+        parts = []
+        if not s.get("accepted"):
+            parts.append("приглашение отправлено")
+        elif s.get("friend_open"):
+            parts.append("друг открыл видео")
+        else:
+            parts.append("друг ещё не открыл видео")
+        if self.remote:
+            ago = max(0, (now_ms() - self.remote_at) // 1000)
+            when = "только что" if ago < 5 else (f"{ago} с назад" if ago < 60 else f"{ago // 60} мин назад")
+            parts.append(("у друга играет " if self.remote["p"] else "у друга пауза на ") +
+                         fmt_time(self.remote["pos"]) + f" ({when})")
+        parts.append("у тебя видео открыто" if self.bound is not None and self.session_player()[1] is not None
+                     else "у тебя видео не открыто")
+        return " · ".join(parts)
+
+    def dialog(self, title, message, positive=None, negative=None, neutral=None, red_negative=False):
+        """Окно с кнопками. Каждая кнопка — (текст, функция или None)."""
+        def ui():
+            frag = get_last_fragment()
+            act = frag.getParentActivity() if frag else None
+            if act is None:
+                BulletinHelper.show_info(f"{title}. {message}")
+                return
+            b = AlertDialogBuilder(act)
+            b.set_title(title)
+            b.set_message(message)
+
+            def wrap(fn):
+                def cb(builder, which):
+                    builder.dismiss()
+                    if fn:
+                        try:
+                            fn()
+                        except Exception as e:
+                            self.logger.error(f"dialog button: {e}")
+                return cb
+
+            if positive:
+                b.set_positive_button(positive[0], wrap(positive[1]))
+            if negative:
+                b.set_negative_button(negative[0], wrap(negative[1]))
+            if neutral:
+                b.set_neutral_button(neutral[0], wrap(neutral[1]))
+            b.show()
+            if red_negative and negative:
+                try:
+                    b.make_button_red(AlertDialogBuilder.BUTTON_NEGATIVE)
+                except Exception:
+                    pass
+        run_on_ui_thread(ui)
+
+    def open_panel(self):
+        if not self.session:
+            self.dialog("🎬 Wtogether",
+                        "Совместный просмотр не идёт.\n\n"
+                        "Чтобы начать: долгое нажатие на видео в личке → Плагины → «Смотреть вместе». "
+                        "Плагин нужен у обоих.",
+                        positive=("Понятно", None))
+            return
+        self.dialog("🎬 " + self.status_title(),
+                    self.status_line().replace(" · ", "\n"),
+                    positive=("Подтянуть друга ко мне", self.resync),
+                    negative=("Закончить", lambda: self.stop_session()),
+                    neutral=("Закрыть", None),
+                    red_negative=True)
+
+    # ---------- действия ----------
 
     def on_watch_click(self, context):
         msg = context.get("message")
@@ -129,39 +268,43 @@ class WtogetherPlugin(BasePlugin):
         if not doc:
             BulletinHelper.show_error("Не удалось распознать видео")
             return
-        self.start_session(did, doc)
-        payload = json.dumps({"t": "invite", "d": doc}, separators=(",", ":"))
-        text = ("🎬 Давай посмотрим это видео вместе! Открой его — пауза и перемотка будут общими.\n"
-                "Нужен плагин Wtogether для exteraGram.\n" + TAG + payload)
+        self.start_session(did, doc, accepted=False)
+        text = ("🎬 Давай посмотрим это видео вместе!\n"
+                "Открой его — пауза и перемотка будут общими.\n"
+                "Нужен плагин Wtogether для exteraGram." + zw_encode({"t": "invite", "d": doc}))
         try:
             send_text(did, text, replyToMsg=msg)
         except Exception:
             send_text(did, text)
-        BulletinHelper.show_success("Приглашение отправлено. Открывай видео")
+        BulletinHelper.show_success(f"Приглашение отправлено {self.friend_name(did)}")
 
-    def on_resync_click(self, context):
-        if not self.session or self.bound is None:
-            BulletinHelper.show_error("Сначала начни совместный просмотр и открой видео")
+    def resync(self):
+        if not self.session or self.bound is None or self.session_player()[1] is None:
+            BulletinHelper.show_error("Сначала открой видео")
             return
         run_on_ui_thread(lambda: self.send_state(force=True))
-        BulletinHelper.show_info("Отправил другу твою позицию")
+        BulletinHelper.show_success("Друг перемотан к твоей позиции")
 
-    def on_stop_click(self, context):
+    def stop_session(self, reload=False):
         if not self.session:
-            BulletinHelper.show_info("Совместный просмотр не идёт")
             return
         self.send_cmd({"t": "stop"})
-        self.session = None
-        self.bound = None
-        self.remote = None
+        self.clear_session()
         BulletinHelper.show_info("Совместный просмотр закончен")
+        if reload:
+            self.set_setting("_state", now_ms(), reload_settings=True)
+
+    def start_session(self, did, doc, accepted=True):
+        self.session = {"dialog": did, "doc": doc, "accepted": accepted, "since": now_ms(), "friend_open": False}
+        self.remote = None
+        self.bound = None
+
+    def clear_session(self):
+        self.session = None
+        self.remote = None
+        self.bound = None
 
     # ---------- плеер ----------
-
-    def start_session(self, did, doc):
-        self.session = {"dialog": did, "doc": doc}
-        self.remote = None
-        self.bound = None
 
     def doc_of(self, msg):
         try:
@@ -177,8 +320,7 @@ class WtogetherPlugin(BasePlugin):
             if PhotoViewer is None:
                 return None, None, None
             try:
-                has = PhotoViewer.getDeclaredMethod("hasInstance").invoke(None)
-                if not has:
+                if not PhotoViewer.getDeclaredMethod("hasInstance").invoke(None):
                     return None, None, None
             except Exception:
                 pass
@@ -208,7 +350,6 @@ class WtogetherPlugin(BasePlugin):
         if sp is None or not sp.equals(player):
             return
         if self.bound is None or not self.bound.equals(player):
-            # видео только что открыли
             self.bound = player
             self.on_video_opened()
             return
@@ -220,9 +361,16 @@ class WtogetherPlugin(BasePlugin):
 
     def on_video_opened(self):
         self.quiet_until = time.time() + QUIET
+        if not self.session.get("accepted"):
+            # открыл видео из приглашения — считаем, что принял
+            self.session["accepted"] = True
+            self.send_cmd({"t": "accept"})
+        name = self.friend_name(self.session["dialog"])
         if self.remote:
+            BulletinHelper.show_info(f"🔗 Подключаюсь к {name}…")
             run_on_ui_thread(self.apply_remote, 800)
         else:
+            BulletinHelper.show_info(f"🔗 Вместе с {name}. Ждём, когда друг откроет видео")
             self.send_cmd({"t": "ask"})
 
     def read_state(self):
@@ -296,21 +444,20 @@ class WtogetherPlugin(BasePlugin):
         t = cmd.get("t")
         if t == "st":
             return ("▶️ смотрим с " if cmd["p"] else "⏸ пауза на ") + fmt_time(cmd["pos"])
-        if t == "ask":
-            return "🔄 подключаюсь"
-        if t == "stop":
-            return "⏹ просмотр закончен"
-        return t or ""
+        return {"ask": "🔄 подключаюсь", "stop": "⏹ просмотр закончен",
+                "accept": "✅ принял(а) приглашение", "decline": "🙅 отказался(ась)"}.get(t, t or "")
 
-    def send_cmd(self, cmd):
+    def send_cmd(self, cmd, did=None, doc=None):
         sess = self.session
-        if not sess:
+        did = did or (sess and sess["dialog"])
+        doc = doc or (sess and sess["doc"])
+        if not did:
             return
-        cmd["d"] = sess["doc"]
+        cmd["d"] = doc
         text = "🎬 Wtogether: " + self.human(cmd) + "\n" + TAG + json.dumps(cmd, separators=(",", ":"))
         try:
             req = TLRPC.TL_messages_sendMessage()
-            req.peer = get_messages_controller().getInputPeer(Long(sess["dialog"]))
+            req.peer = get_messages_controller().getInputPeer(Long(did))
             req.message = text
             req.random_id = random.getrandbits(62)
             req.no_webpage = True
@@ -354,13 +501,10 @@ class WtogetherPlugin(BasePlugin):
     def on_update_hook(self, update_name, account, update):
         try:
             msg = getattr(update, "message", None)
-            if msg is None or msg.out:
-                return HookResult()
-            text = msg.message or ""
-            if TAG not in text:
+            if msg is None or msg.out or not has_cmd(msg.message):
                 return HookResult()
             did = int(MessageObject.getDialogId(msg))
-            if self.handle_incoming(did, int(msg.id), text):
+            if self.handle_incoming(did, int(msg.id), msg.message):
                 return HookResult(strategy=HookStrategy.CANCEL)
         except Exception as e:
             self.logger.error(f"on_update_hook: {e}")
@@ -368,12 +512,9 @@ class WtogetherPlugin(BasePlugin):
 
     def on_updates_hook(self, container_name, account, updates):
         try:
-            if container_name != "TL_updateShortMessage" or updates.out:
+            if container_name != "TL_updateShortMessage" or updates.out or not has_cmd(updates.message):
                 return HookResult()
-            text = updates.message or ""
-            if TAG not in text:
-                return HookResult()
-            if self.handle_incoming(int(updates.user_id), int(updates.id), text):
+            if self.handle_incoming(int(updates.user_id), int(updates.id), updates.message):
                 return HookResult(strategy=HookStrategy.CANCEL)
         except Exception as e:
             self.logger.error(f"on_updates_hook: {e}")
@@ -386,11 +527,39 @@ class WtogetherPlugin(BasePlugin):
                 return u.first_name
         except Exception:
             pass
-        return "Друг"
+        return "друг"
 
     def notify(self, text):
         if self.get_setting("notify", True):
             BulletinHelper.show_info(text)
+
+    def on_invite(self, did, doc):
+        name = self.friend_name(did)
+        self.start_session(did, doc, accepted=False)
+        if not self.get_setting("ask_invite", True):
+            self.session["accepted"] = True
+            self.send_cmd({"t": "accept"})
+            self.notify(f"🎬 {name} зовёт смотреть вместе. Открой видео в чате")
+            return
+
+        def accept():
+            if self.session and self.session["dialog"] == did:
+                self.session["accepted"] = True
+            self.send_cmd({"t": "accept"}, did, doc)
+            BulletinHelper.show_success("Открой видео в чате — над приглашением")
+
+        def decline():
+            self.send_cmd({"t": "decline"}, did, doc)
+            if self.session and self.session["dialog"] == did:
+                self.clear_session()
+
+        self.dialog(f"🎬 {name} зовёт смотреть вместе",
+                    "Откройте это видео оба: пауза, перемотка и скорость будут общими.\n\n"
+                    "Видео — в сообщении, на которое ответил друг.",
+                    positive=("Смотреть", accept),
+                    negative=("Отказаться", decline),
+                    neutral=("Позже", None),
+                    red_negative=True)
 
     def handle_incoming(self, did, mid, text):
         """Разбирает команду друга. True — скрыть сообщение из чата."""
@@ -400,36 +569,45 @@ class WtogetherPlugin(BasePlugin):
         self.seen.add(key)
         if len(self.seen) > 500:
             self.seen.clear()
-        m = TAG_RE.search(text)
-        if not m:
-            return False
-        try:
-            cmd = json.loads(m.group(1))
-        except Exception:
+        cmd = extract_cmd(text)
+        if not cmd:
             return False
         t = cmd.get("t")
         doc = int(cmd.get("d") or 0)
         name = self.friend_name(did)
+        mine = self.session and self.session["dialog"] == did
 
         if t == "invite":
-            self.start_session(did, doc)
-            self.notify(f"🎬 {name} зовёт смотреть видео вместе. Открой его в чате")
+            self.on_invite(did, doc)
             return False  # приглашение остаётся видимым
 
+        if t == "accept":
+            if mine:
+                self.session["accepted"] = True
+                self.notify(f"✅ {name} принял(а) приглашение. Открывай видео")
+            return True
+
+        if t == "decline":
+            if mine:
+                self.clear_session()
+                self.dialog("Wtogether", f"{name} отказался(ась) от совместного просмотра.",
+                            positive=("Ок", None))
+            return True
+
         if t == "stop":
-            if self.session and self.session["dialog"] == did:
-                self.session = None
-                self.bound = None
-                self.remote = None
-                self.notify(f"{name} закончил(а) совместный просмотр")
+            if mine:
+                self.clear_session()
+                self.notify(f"⏹ {name} закончил(а) совместный просмотр")
             return True
 
         # команда к другому видео или после перезапуска: подхватываем сессию
-        if not self.session or self.session["dialog"] != did or self.session["doc"] != doc:
-            self.start_session(did, doc)
+        if not mine or self.session["doc"] != doc:
+            self.start_session(did, doc, accepted=True)
+        self.session["accepted"] = True
+        self.session["friend_open"] = True
 
         if t == "ask":
-            self.notify(f"{name} открыл(а) видео")
+            self.notify(f"🔗 {name} открыл(а) видео")
             run_on_ui_thread(lambda: self.send_state(force=True))
             return True
 
@@ -437,6 +615,7 @@ class WtogetherPlugin(BasePlugin):
             prev = self.remote
             self.remote = {"p": bool(cmd.get("p")), "pos": int(cmd.get("pos") or 0),
                            "r": float(cmd.get("r") or 1.0), "ts": int(cmd.get("ts") or now_ms())}
+            self.remote_at = now_ms()
             if prev is None or prev["p"] != self.remote["p"]:
                 self.notify(f"{name}: " + self.human(cmd))
             run_on_ui_thread(self.apply_remote)

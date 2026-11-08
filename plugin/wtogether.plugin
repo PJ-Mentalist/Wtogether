@@ -1,19 +1,18 @@
 """
-Wtogether для exteraGram: совместный просмотр видео из личных чатов.
+Wtogether для exteraGram 2.0 — совместный просмотр в собственном плеере.
 
-Лобби:
-- Кто позвал смотреть — ведущий 👑. Только он управляет видео: пауза, перемотка, скорость.
-- Зрителей может быть несколько: перешли видео другу и нажми «Смотреть вместе» в его чате.
-- Ведущий видит всех: кто смотрит, кто ещё не открыл видео, кто не ответил.
+Как работает:
+1. Долгое нажатие на видео в личке → Плагины → «🎬 Смотреть вместе».
+   Ты ведущий 👑, другу уходит приглашение, у тебя открывается плеер Wtogether.
+2. Друг нажимает «Смотреть» в окне приглашения — у него открывается тот же плеер.
+3. Видео загружается у каждого. В лобби видно, кто готов. Ведущий жмёт «Начать» —
+   у всех отсчёт 3‑2‑1 и одновременный старт.
+4. Управляет только ведущий: пауза, перемотка, скорость. У зрителей кнопки заблокированы,
+   а плеер сам держит их рядом с ведущим (плавно подстраивает скорость или перематывает).
+5. Ещё зрители: перешли видео другому другу и снова «Смотреть вместе» в его чате.
 
-На экране видео:
-- в любой личке на видео есть кнопка «🎬 Смотреть вместе»;
-- в лобби: аватарки участников вверху, кнопки −10 с, ▶/⏸, +10 с, 💬, 📞, ➕ у ведущего
-  и 💬, 📞, 🔄 у зрителей;
-- сообщения всплывают поверх видео у всех, после просмотра уходят в чаты одним сообщением.
-
-Служебные команды идут тихими сообщениями: у получателя скрываются, у отправителя удаляются.
-Плагин должен стоять у всех участников.
+Команды идут тихими служебными сообщениями Telegram: у получателя скрываются,
+у отправителя удаляются. Плагин нужен у всех участников.
 """
 import json
 import random
@@ -21,22 +20,23 @@ import re
 import threading
 import time
 
-from base_plugin import BasePlugin, HookResult, HookStrategy, MenuItemData, MenuItemType, MethodHook
-from hook_utils import find_class, get_private_field
-from client_utils import send_request, send_text, get_messages_controller, get_last_fragment
+from base_plugin import BasePlugin, HookResult, HookStrategy, MenuItemData, MenuItemType
+from client_utils import (send_request, send_text, get_messages_controller, get_last_fragment,
+                          get_file_loader, NotificationCenterDelegate, get_notification_center)
 from android_utils import run_on_ui_thread, OnClickListener, copy_to_clipboard
 from ui.bulletin import BulletinHelper
 from ui.alert import AlertDialogBuilder
 from ui.settings import Header, Switch, Text, Divider
-from java.lang import Integer, Long
+from java import dynamic_proxy
+from java.lang import Boolean, Integer, Long
 from org.telegram.tgnet import TLRPC
-from org.telegram.messenger import MessageObject
+from org.telegram.messenger import MessageObject, NotificationCenter
 
 __id__ = "wtogether"
 __name__ = "Wtogether"
-__description__ = "Совместный просмотр видео: ведущий управляет, зрители смотрят синхронно, кнопки и аватарки поверх видео"
+__description__ = "Совместный просмотр видео в своём плеере: ведущий управляет, у всех синхронно, лобби, чат и звонок"
 __author__ = "Wtogether"
-__version__ = "1.3.0"
+__version__ = "2.0.0"
 # Иконка: имя_набора_стикеров/номер. После создания своего набора через @Stickers замени на "ИмяНабора/0"
 __icon__ = "exteraPlugins/1"
 __category__ = ["media", "chats"]
@@ -45,23 +45,29 @@ TAG = "#wt1 "
 TAG_RE = re.compile(r"#wt1 (\{.*\})", re.S)
 ZW0, ZW1, ZWM = "​", "‌", "⁣"
 
-WATCH_MS = 500         # как часто проверяем открытый просмотрщик
-SEND_DELAY = 0.45      # с: склеиваем частые события в одну команду
-QUIET = 1.5            # с: после применения команды не реагируем на «эхо»
-DRIFT_MS = 700         # расхождение, после которого перематываем
-DELETE_AFTER = 3.0     # с: через сколько удалять свою служебную команду с сервера
+TICK_MS = 300            # цикл плеера
+HEARTBEAT_S = 3.0        # ведущий шлёт состояние во время воспроизведения
+COUNTDOWN_MS = 3000      # отсчёт перед стартом
+SMALL_DRIFT = 150        # мс: меньше — не трогаем
+BIG_DRIFT = 2000         # мс: больше — перематываем, между — подстраиваем скорость
+NUDGE = 0.08             # насколько ускоряем/замедляем при подстройке
+NUDGE_DONE = 80          # мс: до какого расхождения подтягиваем, раз начали
+PING_EVERY = 20.0        # с: зритель регулярно уточняет разницу часов
+SEEK_COOLDOWN = 1.5      # с: после перемотки даём плееру устояться
+DELETE_EVERY = 4.0       # с: пакетное удаление своих служебных сообщений
 SKIP_MS = 10000
-BUBBLE_MS = 7000
+SPEEDS = [1.0, 1.25, 1.5, 2.0, 0.75]
 MAX_GUESTS = 10
 
 ACCENT = "#3E8EF7"
 DARK = "#99000000"
-DARKER = "#B3000000"
+PANEL = "#CC0B0F14"
 ONLINE = "#4CD964"
 OFFLINE = "#8E8E93"
 WAITING = "#FFB340"
-GOLD = "#FFC93C"
 
+
+# ---------------- утилиты ----------------
 
 def now_ms():
     return int(time.time() * 1000)
@@ -113,251 +119,594 @@ def has_cmd(text):
     return bool(text) and (ZWM in text or TAG in text)
 
 
-class PlayerHook(MethodHook):
-    def __init__(self, plugin, name):
-        self.plugin = plugin
-        self.name = name
+def expected_pos(st, room_now):
+    """Где сейчас должен быть ведущий по последнему состоянию."""
+    if not st["p"]:
+        return st["pos"]
+    return st["pos"] + max(0, room_now - st["ts"]) * st["r"]
 
-    def after_hooked_method(self, param):
+
+def plan_correction(st, room_now, cur, playing, nudging=False):
+    """Что сделать зрителю, чтобы совпасть с ведущим.
+    Возвращает (play: bool, seek_to: int|None, speed: float, nudging: bool).
+    Подстройка скорости включается при расхождении > SMALL_DRIFT
+    и держится, пока не сойдёмся до NUDGE_DONE (гистерезис)."""
+    target = expected_pos(st, room_now)
+    diff = cur - target
+    if not st["p"]:
+        return False, (int(target) if abs(diff) > SMALL_DRIFT else None), st["r"], False
+    if not playing:
+        # запускаемся — сразу встаём точно в нужное место
+        return True, (int(target) if abs(diff) > NUDGE_DONE else None), st["r"], False
+    if abs(diff) > BIG_DRIFT:
+        return True, int(target), st["r"], False
+    if abs(diff) > SMALL_DRIFT or (nudging and abs(diff) > NUDGE_DONE):
+        return True, None, st["r"] * (1 - NUDGE if diff > 0 else 1 + NUDGE), True
+    return True, None, st["r"], False
+
+
+# ---------------- обёртки Java-интерфейсов ----------------
+
+def listeners():
+    """Классы-обёртки создаются при первом использовании, чтобы плагин грузился даже без них."""
+    if hasattr(listeners, "cache"):
+        return listeners.cache
+    from android.media import MediaPlayer
+    from android.widget import SeekBar
+    from android.content import DialogInterface
+
+    class Prepared(dynamic_proxy(MediaPlayer.OnPreparedListener)):
+        def __init__(self, fn):
+            super().__init__()
+            self.fn = fn
+
+        def onPrepared(self, mp):
+            self.fn(mp)
+
+    class Completed(dynamic_proxy(MediaPlayer.OnCompletionListener)):
+        def __init__(self, fn):
+            super().__init__()
+            self.fn = fn
+
+        def onCompletion(self, mp):
+            self.fn(mp)
+
+    class Failed(dynamic_proxy(MediaPlayer.OnErrorListener)):
+        def __init__(self, fn):
+            super().__init__()
+            self.fn = fn
+
+        def onError(self, mp, what, extra):
+            self.fn(what, extra)
+            return True
+
+    class Seek(dynamic_proxy(SeekBar.OnSeekBarChangeListener)):
+        def __init__(self, on_change, on_start, on_stop):
+            super().__init__()
+            self.on_change, self.on_start, self.on_stop = on_change, on_start, on_stop
+
+        def onProgressChanged(self, sb, progress, from_user):
+            self.on_change(int(progress), bool(from_user))
+
+        def onStartTrackingTouch(self, sb):
+            self.on_start()
+
+        def onStopTrackingTouch(self, sb):
+            self.on_stop(int(sb.getProgress()))
+
+    class Keys(dynamic_proxy(DialogInterface.OnKeyListener)):
+        def __init__(self, fn):
+            super().__init__()
+            self.fn = fn
+
+        def onKey(self, dialog, code, event):
+            if code == 4:  # «назад»
+                if event.getAction() == 1:
+                    self.fn()
+                return True
+            return False
+
+    class Dismissed(dynamic_proxy(DialogInterface.OnDismissListener)):
+        def __init__(self, fn):
+            super().__init__()
+            self.fn = fn
+
+        def onDismiss(self, dialog):
+            self.fn()
+
+    listeners.cache = dict(Prepared=Prepared, Completed=Completed, Failed=Failed,
+                           Seek=Seek, Keys=Keys, Dismissed=Dismissed)
+    return listeners.cache
+
+
+class NewMessages(NotificationCenterDelegate):
+    """Запасной путь приёма команд — если хук обновлений не сработал."""
+    plugin = None
+
+    def didReceivedNotification(self, id, account, args):
         try:
-            self.plugin.on_player_event(param.thisObject, self.name)
+            if id == NotificationCenter.didReceiveNewMessages:
+                self.plugin.on_new_messages(int(args[0]), args[1])
         except Exception as e:
-            self.plugin.err(f"player hook {self.name}: {e}")
+            self.plugin.err(f"didReceiveNewMessages: {e}")
 
 
-class ActionBarHook(MethodHook):
-    """Плеер прячет и показывает свои панели — делаем так же с нашими кнопками."""
-    def __init__(self, plugin):
-        self.plugin = plugin
+# ---------------- плеер ----------------
 
-    def after_hooked_method(self, param):
-        try:
-            if param.args is not None and len(param.args) > 0:
-                self.plugin.set_controls_visible(bool(param.args[0]))
-        except Exception as e:
-            self.plugin.err(f"toggleActionBar: {e}")
+class Player:
+    """Полноэкранный плеер Wtogether."""
 
+    def __init__(self, plugin, mo):
+        from android.app import Dialog
+        from android import R as AR
+        from android.view import WindowManager
 
-class Overlay:
-    """Интерфейс поверх просмотрщика. mode: "start" — кнопка «Смотреть вместе», "lobby" — лобби."""
+        self.p = plugin
+        self.mo = mo
+        self.alive = True
+        self.vv = None
+        self.mp = None
+        self.prepared = False
+        self.duration = 0
+        self.dragging = False
+        self.seek_block_until = 0.0
+        self.speed = 1.0
+        self.countdown_at = 0
+        self.bubbles = []
+        self.heads_sig = None
+        self.controls_shown = True
+        self.last_beat = 0.0
+        self.local_path = None
 
-    def __init__(self, plugin, pv, mode, msg):
-        from android.widget import FrameLayout, LinearLayout, TextView
+        self.act = plugin.activity()
+        if self.act is None:
+            raise RuntimeError("нет активного окна")
+        self.prev_orientation = self.act.getRequestedOrientation()
+        self.build()
+
+        L = listeners()
+        self.dialog = Dialog(self.act, AR.style.Theme_Black_NoTitleBar_Fullscreen)
+        self.dialog.setContentView(self.root)
+        self.dialog.setCancelable(False)
+        self.dialog.setOnKeyListener(L["Keys"](lambda: self.p.safe(self.p.ask_close)))
+        self.dialog.setOnDismissListener(L["Dismissed"](lambda: self.p.safe(self.on_dismissed)))
+        w = self.dialog.getWindow()
+        w.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        w.setSoftInputMode(16)  # adjustResize
+        self.dialog.show()
+
+        self.load()
+        run_on_ui_thread(self.tick, TICK_MS)
+
+    # ---------- построение интерфейса ----------
+
+    def build(self):
+        from android.widget import FrameLayout, LinearLayout, TextView, SeekBar, EditText, VideoView
         from android.view import Gravity
         from android.graphics import Color, Typeface
         from android.graphics.drawable import GradientDrawable
+        from android.content.res import ColorStateList
         from org.telegram.messenger import AndroidUtilities
 
-        self.p = plugin
-        self.pv = pv
-        self.mode = mode
-        self.msg = msg
-        self.msg_key = (int(msg.getDialogId()), int(msg.getId()))
-        self.FrameLayout, self.LinearLayout, self.TextView = FrameLayout, LinearLayout, TextView
-        self.Gravity, self.Color, self.Typeface, self.GradientDrawable = Gravity, Color, Typeface, GradientDrawable
-        self.dp = lambda v: AndroidUtilities.dp(float(v))
-        self.alive = True
-        self.bubbles = []
-        self.heads_sig = None
-        self.controls = None
+        self.FL, self.LL, self.TV = FrameLayout, LinearLayout, TextView
+        self.Gravity, self.Color, self.Typeface, self.GD = Gravity, Color, Typeface, GradientDrawable
+        dp = self.dp = lambda v: AndroidUtilities.dp(float(v))
+        ctx = self.act
+        host = self.p.is_host()
 
-        self.container = get_private_field(pv, "containerView")
-        if self.container is None:
-            raise RuntimeError("containerView не найден")
-        self.ctx = self.container.getContext()
-        self.root = FrameLayout(self.ctx)
+        self.root = FrameLayout(ctx)
+        self.root.setBackgroundColor(Color.BLACK)
+        self.root.setOnClickListener(OnClickListener(lambda v: self.toggle_controls()))
 
-        if mode == "start":
-            self.build_start()
+        # видео
+        self.vv = VideoView(ctx)
+        self.root.addView(self.vv, FrameLayout.LayoutParams(-1, -1, Gravity.CENTER))
+
+        # центр: загрузка, лобби, отсчёт
+        self.center = LinearLayout(ctx)
+        self.center.setOrientation(LinearLayout.VERTICAL)
+        self.center.setGravity(Gravity.CENTER)
+        self.big = self.text("", 44.0, True)
+        self.big.setGravity(Gravity.CENTER)
+        self.center.addView(self.big, LinearLayout.LayoutParams(-2, -2))
+        self.info = self.text("", 15.0)
+        self.info.setGravity(Gravity.CENTER)
+        self.info.setPadding(dp(24), dp(6), dp(24), dp(6))
+        self.center.addView(self.info, LinearLayout.LayoutParams(-2, -2))
+        self.start_btn = self.pill("▶  Начать для всех", ACCENT, lambda: self.p.host_start())
+        slp = LinearLayout.LayoutParams(-2, -2)
+        slp.topMargin = dp(16)
+        self.center.addView(self.start_btn, slp)
+        self.start_btn.setVisibility(8)
+        self.root.addView(self.center, FrameLayout.LayoutParams(-1, -2, Gravity.CENTER))
+
+        # верх: закрыть, заголовок, головы
+        self.top = LinearLayout(ctx)
+        self.top.setOrientation(LinearLayout.HORIZONTAL)
+        self.top.setGravity(Gravity.CENTER_VERTICAL)
+        self.top.setPadding(dp(8), dp(28), dp(12), dp(10))
+        self.top.setBackground(self.grad(True))
+        close = self.round_btn("✕", DARK, 40, lambda: self.p.ask_close(), 16.0)
+        self.top.addView(close, LinearLayout.LayoutParams(dp(40), dp(40)))
+        titles = LinearLayout(ctx)
+        titles.setOrientation(LinearLayout.VERTICAL)
+        self.title = self.text("Wtogether", 16.0, True)
+        self.title.setSingleLine(True)
+        self.subtitle = self.text("", 12.5)
+        self.subtitle.setSingleLine(True)
+        self.subtitle.setAlpha(0.8)
+        titles.addView(self.title)
+        titles.addView(self.subtitle)
+        tlp = LinearLayout.LayoutParams(0, -2, 1.0)
+        tlp.leftMargin = dp(10)
+        self.top.addView(titles, tlp)
+        self.faces = LinearLayout(ctx)
+        self.faces.setOrientation(LinearLayout.HORIZONTAL)
+        self.faces.setPadding(dp(4), dp(4), dp(4), dp(4))
+        self.faces.setBackground(self.shape(DARK, dp(20)))
+        self.faces.setOnClickListener(OnClickListener(lambda v: self.p.open_panel()))
+        self.top.addView(self.faces, LinearLayout.LayoutParams(-2, -2))
+        self.root.addView(self.top, FrameLayout.LayoutParams(-1, -2, Gravity.TOP))
+
+        # лента сообщений
+        self.feed = LinearLayout(ctx)
+        self.feed.setOrientation(LinearLayout.VERTICAL)
+        flp = FrameLayout.LayoutParams(dp(280), -2, Gravity.BOTTOM | Gravity.START)
+        flp.leftMargin = dp(12)
+        flp.bottomMargin = dp(212)
+        self.root.addView(self.feed, flp)
+
+        # низ: ползунок, кнопки, сообщение
+        self.bottom = LinearLayout(ctx)
+        self.bottom.setOrientation(LinearLayout.VERTICAL)
+        self.bottom.setPadding(dp(12), dp(16), dp(12), dp(14))
+        self.bottom.setBackground(self.grad(False))
+        self.bottom.setOnClickListener(OnClickListener(lambda v: None))  # не прячем по нажатию на панель
+
+        row = LinearLayout(ctx)
+        row.setOrientation(LinearLayout.HORIZONTAL)
+        row.setGravity(Gravity.CENTER_VERTICAL)
+        self.time_cur = self.text("0:00", 12.5, True)
+        row.addView(self.time_cur)
+        self.seek = SeekBar(ctx)
+        self.seek.setMax(1000)
+        try:
+            tint = ColorStateList.valueOf(Color.parseColor(ACCENT))
+            self.seek.setProgressTintList(tint)
+            self.seek.setThumbTintList(tint)
+        except Exception:
+            pass
+        L = listeners()
+        self.seek.setOnSeekBarChangeListener(L["Seek"](self.on_seek_change, self.on_seek_start, self.on_seek_stop))
+        self.seek.setEnabled(host)
+        row.addView(self.seek, LinearLayout.LayoutParams(0, -2, 1.0))
+        self.time_all = self.text("0:00", 12.5, True)
+        row.addView(self.time_all)
+        self.bottom.addView(row, LinearLayout.LayoutParams(-1, -2))
+
+        ctl = LinearLayout(ctx)
+        ctl.setOrientation(LinearLayout.HORIZONTAL)
+        ctl.setGravity(Gravity.CENTER)
+        p = self.p
+        self.btn_play = None
+        self.btn_speed = None
+        if host:
+            items = [("−10", DARK, lambda: p.host_skip(-SKIP_MS), 48, 15.0),
+                     ("▶", ACCENT, p.host_toggle, 62, 24.0),
+                     ("+10", DARK, lambda: p.host_skip(SKIP_MS), 48, 15.0),
+                     ("1×", DARK, p.host_speed, 48, 14.0)]
         else:
-            self.build_lobby()
+            items = [("🔄", DARK, p.catch_up, 48, 18.0)]
+        items += [("📞", DARK, p.start_call, 48, 18.0), ("⤢", DARK, self.rotate, 48, 18.0)]
+        for text, color, fn, size, ts in items:
+            b = self.round_btn(text, color, size, fn, ts)
+            if text == "▶":
+                self.btn_play = b
+            if text == "1×":
+                self.btn_speed = b
+            blp = LinearLayout.LayoutParams(dp(size), dp(size))
+            blp.leftMargin = dp(6)
+            blp.rightMargin = dp(6)
+            ctl.addView(b, blp)
+        clp = LinearLayout.LayoutParams(-1, -2)
+        clp.topMargin = dp(6)
+        self.bottom.addView(ctl, clp)
 
-        self.container.addView(self.root, FrameLayout.LayoutParams(-1, -1))
-        self.update()
+        if not host:
+            self.lock = self.text("🔒 Управляет ведущий", 12.5)
+            self.lock.setGravity(Gravity.CENTER)
+            self.lock.setAlpha(0.75)
+            llp = LinearLayout.LayoutParams(-1, -2)
+            llp.topMargin = dp(6)
+            self.bottom.addView(self.lock, llp)
 
-    # --- общие элементы ---
+        say = LinearLayout(ctx)
+        say.setOrientation(LinearLayout.HORIZONTAL)
+        say.setGravity(Gravity.CENTER_VERTICAL)
+        self.input = EditText(ctx)
+        self.input.setHint("Сообщение всем…")
+        self.input.setTextColor(Color.WHITE)
+        self.input.setHintTextColor(Color.parseColor("#99FFFFFF"))
+        self.input.setSingleLine(True)
+        self.input.setTextSize(15.0)
+        self.input.setPadding(dp(16), dp(10), dp(16), dp(10))
+        self.input.setBackground(self.shape("#33FFFFFF", dp(22)))
+        say.addView(self.input, LinearLayout.LayoutParams(0, -2, 1.0))
+        send = self.round_btn("➤", ACCENT, 44, self.send_input, 17.0)
+        sl = LinearLayout.LayoutParams(dp(44), dp(44))
+        sl.leftMargin = dp(8)
+        say.addView(send, sl)
+        sylp = LinearLayout.LayoutParams(-1, -2)
+        sylp.topMargin = dp(12)
+        self.bottom.addView(say, sylp)
 
-    def round(self, color, radius, oval=False):
-        d = self.GradientDrawable()
-        d.setColor(self.Color.parseColor(color))
-        if oval:
-            d.setShape(self.GradientDrawable.OVAL)
-        else:
-            d.setCornerRadius(float(radius))
-        return d
+        self.root.addView(self.bottom, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
 
-    def label(self, text, size=14.0, bold=False):
-        t = self.TextView(self.ctx)
-        t.setText(text)
+        Prepared, Completed, Failed = L["Prepared"], L["Completed"], L["Failed"]
+        self.vv.setOnPreparedListener(Prepared(lambda mp: self.p.safe(lambda: self.on_prepared(mp))))
+        self.vv.setOnCompletionListener(Completed(lambda mp: self.p.safe(lambda: self.p.on_completed())))
+        self.vv.setOnErrorListener(Failed(lambda w, e: self.p.safe(lambda: self.on_error(w, e))))
+
+    def text(self, s, size=14.0, bold=False):
+        t = self.TV(self.act)
+        t.setText(s)
         t.setTextColor(self.Color.WHITE)
         t.setTextSize(size)
         if bold:
             t.setTypeface(self.Typeface.DEFAULT_BOLD)
         return t
 
-    def button(self, text, color, on_click, text_size=15.0):
-        b = self.label(text, text_size, True)
+    def shape(self, color, radius, oval=False):
+        d = self.GD()
+        d.setColor(self.Color.parseColor(color))
+        if oval:
+            d.setShape(self.GD.OVAL)
+        else:
+            d.setCornerRadius(float(radius))
+        return d
+
+    def grad(self, top):
+        from java import jarray, jint
+        colors = jarray(jint)([self.Color.parseColor("#D9000000"), self.Color.parseColor("#00000000")])
+        orient = self.GD.Orientation.TOP_BOTTOM if top else self.GD.Orientation.BOTTOM_TOP
+        return self.GD(orient, colors)
+
+    def round_btn(self, label, color, size, fn, ts=15.0):
+        b = self.text(label, ts, True)
         b.setGravity(self.Gravity.CENTER)
-        b.setBackground(self.round(color, 0, oval=True))
-        b.setOnClickListener(OnClickListener(lambda v: self.p.safe(on_click)))
+        b.setBackground(self.shape(color, 0, oval=True))
+        b.setOnClickListener(OnClickListener(lambda v: self.p.safe(fn)))
         return b
 
-    def head(self, user, name, dot_color, crown=False):
+    def pill(self, label, color, fn):
         dp = self.dp
-        box = self.FrameLayout(self.ctx)
-        box.setBackground(self.round("#FFFFFF", 0, oval=True))
+        b = self.text(label, 16.0, True)
+        b.setGravity(self.Gravity.CENTER)
+        b.setPadding(dp(24), dp(12), dp(24), dp(13))
+        b.setBackground(self.shape(color, dp(26)))
+        b.setOnClickListener(OnClickListener(lambda v: self.p.safe(fn)))
+        return b
+
+    def head(self, user, name, dot, crown):
+        dp = self.dp
+        box = self.FL(self.act)
+        box.setBackground(self.shape("#FFFFFF", 0, oval=True))
         box.setPadding(dp(2), dp(2), dp(2), dp(2))
         pic = None
         try:
             if user is not None:
                 from org.telegram.ui.Components import BackupImageView, AvatarDrawable
-                pic = BackupImageView(self.ctx)
+                pic = BackupImageView(self.act)
                 pic.setRoundRadius(dp(15))
                 pic.setForUserOrChat(user, AvatarDrawable(user))
         except Exception as e:
             self.p.err(f"аватарка: {e}")
             pic = None
         if pic is None:
-            pic = self.label((name or "?")[:1].upper(), 14.0, True)
+            pic = self.text((name or "?")[:1].upper(), 14.0, True)
             pic.setGravity(self.Gravity.CENTER)
-            pic.setBackground(self.round(ACCENT, 0, oval=True))
-        box.addView(pic, self.FrameLayout.LayoutParams(-1, -1))
-        dot = self.TextView(self.ctx)
-        dot.setBackground(self.round(dot_color, 0, oval=True))
-        box.addView(dot, self.FrameLayout.LayoutParams(dp(10), dp(10), self.Gravity.BOTTOM | self.Gravity.END))
+            pic.setBackground(self.shape(ACCENT, 0, oval=True))
+        box.addView(pic, self.FL.LayoutParams(-1, -1))
+        d = self.TV(self.act)
+        d.setBackground(self.shape(dot, 0, oval=True))
+        box.addView(d, self.FL.LayoutParams(dp(10), dp(10), self.Gravity.BOTTOM | self.Gravity.END))
         if crown:
-            c = self.label("👑", 10.0)
-            box.addView(c, self.FrameLayout.LayoutParams(-2, -2, self.Gravity.TOP | self.Gravity.END))
+            box.addView(self.text("👑", 10.0), self.FL.LayoutParams(-2, -2, self.Gravity.TOP | self.Gravity.END))
         return box
 
-    # --- режим «старт» ---
+    # ---------- загрузка видео ----------
 
-    def build_start(self):
-        dp = self.dp
-        b = self.label("🎬  Смотреть вместе", 15.0, True)
-        b.setGravity(self.Gravity.CENTER)
-        b.setPadding(dp(20), dp(11), dp(20), dp(12))
-        b.setBackground(self.round(ACCENT, dp(24)))
-        b.setOnClickListener(OnClickListener(lambda v: self.p.safe(lambda: self.p.invite_from(self.msg))))
-        lp = self.FrameLayout.LayoutParams(-2, -2, self.Gravity.BOTTOM | self.Gravity.CENTER_HORIZONTAL)
-        lp.bottomMargin = dp(108)
-        self.root.addView(b, lp)
-        self.controls = b
+    def load(self):
+        path = self.p.local_path(self.mo)
+        if path:
+            self.open_file(path)
+            return
+        self.big.setText("⏬")
+        self.info.setText("Загружаю видео…")
+        self.p.download(self.mo)
+        self.poll_download()
 
-    # --- режим «лобби» ---
+    def poll_download(self):
+        if not self.alive:
+            return
+        path = self.p.local_path(self.mo)
+        if path:
+            self.open_file(path)
+            return
+        pc = self.p.download_percent(self.mo)
+        self.info.setText(f"Загружаю видео… {pc}%" if pc else "Загружаю видео…")
+        self.p.report_progress(pc)
+        run_on_ui_thread(self.poll_download, 500)
 
-    def build_lobby(self):
-        dp = self.dp
-        LP = self.FrameLayout.LayoutParams
-        LL = self.LinearLayout
+    def open_file(self, path):
+        self.local_path = path
+        self.big.setText("")
+        self.info.setText("Готовлю плеер…")
+        self.vv.setVideoPath(path)
 
-        # головы участников
-        self.heads = LL(self.ctx)
-        self.heads.setOrientation(LL.HORIZONTAL)
-        self.heads.setGravity(self.Gravity.CENTER_VERTICAL)
-        self.heads.setPadding(dp(5), dp(5), dp(12), dp(5))
-        self.heads.setBackground(self.round(DARK, dp(22)))
-        self.faces = LL(self.ctx)
-        self.faces.setOrientation(LL.HORIZONTAL)
-        self.heads.addView(self.faces, LL.LayoutParams(-2, -2))
-        self.status = self.label("", 13.0, True)
-        self.status.setSingleLine(True)
-        slp = LL.LayoutParams(-2, -2)
-        slp.leftMargin = dp(8)
-        self.heads.addView(self.status, slp)
-        self.heads.setOnClickListener(OnClickListener(lambda v: self.p.safe(self.p.open_panel)))
-        hlp = LP(-2, -2, self.Gravity.TOP | self.Gravity.END)
-        hlp.topMargin = dp(92)
-        hlp.rightMargin = dp(12)
-        self.root.addView(self.heads, hlp)
+    def on_prepared(self, mp):
+        self.mp = mp
+        self.prepared = True
+        self.duration = int(mp.getDuration())
+        self.time_all.setText(fmt_time(self.duration))
+        try:
+            mp.setLooping(False)
+        except Exception:
+            pass
+        self.vv.seekTo(0)
+        self.p.on_player_ready()
 
-        # лента сообщений
-        self.feed = LL(self.ctx)
-        self.feed.setOrientation(LL.VERTICAL)
-        flp = LP(dp(270), -2, self.Gravity.BOTTOM | self.Gravity.START)
-        flp.leftMargin = dp(12)
-        flp.bottomMargin = dp(186)
-        self.root.addView(self.feed, flp)
+    def on_error(self, what, extra):
+        self.p.err(f"плеер: ошибка {what}/{extra}")
+        self.big.setText("⚠️")
+        self.info.setText("Это видео не открывается на устройстве")
 
-        # кнопки
-        self.controls = LL(self.ctx)
-        self.controls.setOrientation(LL.HORIZONTAL)
-        self.controls.setGravity(self.Gravity.CENTER)
-        p = self.p
-        self.btn_play = None
-        if p.is_host():
-            items = [("−10", DARK, lambda: p.skip(-SKIP_MS), 15.0, 48),
-                     ("▶", ACCENT, p.play_pause, 24.0, 60),
-                     ("+10", DARK, lambda: p.skip(SKIP_MS), 15.0, 48),
-                     ("💬", DARK, p.compose_message, 19.0, 46),
-                     ("📞", DARK, p.start_call, 19.0, 46),
-                     ("➕", DARK, p.how_to_add, 19.0, 46)]
-        else:
-            items = [("🔄", DARK, p.catch_up, 19.0, 50),
-                     ("💬", DARK, p.compose_message, 19.0, 50),
-                     ("📞", DARK, p.start_call, 19.0, 50)]
-        for text, color, fn, ts, size in items:
-            b = self.button(text, color, fn, ts)
-            if text == "▶":
-                self.btn_play = b
-            blp = LL.LayoutParams(dp(size), dp(size))
-            blp.leftMargin = dp(5)
-            blp.rightMargin = dp(5)
-            self.controls.addView(b, blp)
-        clp = LP(-2, -2, self.Gravity.BOTTOM | self.Gravity.CENTER_HORIZONTAL)
-        clp.bottomMargin = dp(104)
-        self.root.addView(self.controls, clp)
-        if not p.get_setting("controls", True):
-            self.controls.setVisibility(8)
+    # ---------- управление ----------
 
-    def rebuild_faces(self, people):
-        """people: [(user, name, dot_color, crown)]"""
+    def position(self):
+        try:
+            return int(self.vv.getCurrentPosition()) if self.prepared else 0
+        except Exception:
+            return 0
+
+    def playing(self):
+        try:
+            return bool(self.vv.isPlaying())
+        except Exception:
+            return False
+
+    def seek_to(self, ms):
+        if not self.prepared:
+            return
+        ms = max(0, min(int(ms), max(0, self.duration - 300)))
+        try:
+            if self.mp is not None:
+                self.mp.seekTo(ms, 3)  # SEEK_CLOSEST — точно в нужный кадр
+            else:
+                self.vv.seekTo(ms)
+        except Exception:
+            self.vv.seekTo(ms)
+        self.seek_block_until = time.time() + SEEK_COOLDOWN
+
+    def play(self):
+        if self.prepared and not self.playing():
+            self.vv.start()
+
+    def pause(self):
+        if self.prepared and self.playing():
+            self.vv.pause()
+
+    def set_speed(self, x):
+        x = round(float(x), 3)
+        if abs(x - self.speed) < 0.001 or self.mp is None or not self.playing():
+            return
+        try:
+            params = self.mp.getPlaybackParams()
+            params.setSpeed(x)
+            self.mp.setPlaybackParams(params)
+            self.speed = x
+        except Exception as e:
+            self.p.err(f"скорость: {e}")
+
+    # ---------- ползунок ----------
+
+    def on_seek_change(self, progress, from_user):
+        if from_user and self.duration:
+            self.time_cur.setText(fmt_time(self.duration * progress / 1000))
+
+    def on_seek_start(self):
+        self.dragging = True
+
+    def on_seek_stop(self, progress):
+        self.dragging = False
+        if self.p.is_host() and self.duration:
+            self.p.host_seek(int(self.duration * progress / 1000))
+
+    # ---------- цикл ----------
+
+    def tick(self):
+        if not self.alive:
+            return
+        try:
+            self.p.on_tick(self)
+            if self.prepared and not self.dragging:
+                pos = self.position()
+                self.time_cur.setText(fmt_time(pos))
+                if self.duration:
+                    self.seek.setProgress(int(pos * 1000 / self.duration))
+            if self.btn_play is not None:
+                self.btn_play.setText("⏸" if self.playing() else "▶")
+            self.refresh_faces()
+        except Exception as e:
+            self.p.err(f"tick: {e}")
+        run_on_ui_thread(self.tick, TICK_MS)
+
+    def refresh_faces(self):
+        people = self.p.lobby_people()
         sig = tuple((n, c, cr) for _, n, c, cr in people)
         if sig == self.heads_sig:
             return
         self.heads_sig = sig
         dp = self.dp
         self.faces.removeAllViews()
-        shown = people[:6]
-        for i, (user, name, color, crown) in enumerate(shown):
-            lp = self.LinearLayout.LayoutParams(dp(34), dp(34))
+        for i, (user, name, dot, crown) in enumerate(people[:6]):
+            lp = self.LL.LayoutParams(dp(32), dp(32))
             if i:
-                lp.leftMargin = -dp(9)
-            self.faces.addView(self.head(user, name, color, crown), lp)
-        if len(people) > len(shown):
-            more = self.label(f"+{len(people) - len(shown)}", 12.0, True)
-            mlp = self.LinearLayout.LayoutParams(-2, -2)
-            mlp.leftMargin = dp(4)
-            self.faces.addView(more, mlp)
+                lp.leftMargin = -dp(8)
+            self.faces.addView(self.head(user, name, dot, crown), lp)
+        if len(people) > 6:
+            more = self.text(f"+{len(people) - 6}", 12.0, True)
+            ml = self.LL.LayoutParams(-2, -2)
+            ml.leftMargin = dp(4)
+            self.faces.addView(more, ml)
 
-    def update(self):
-        if not self.alive or self.mode != "lobby":
-            return
-        p = self.p
-        pv, player, _ = p.session_player()
-        pos = 0
-        if player is not None:
-            try:
-                pos = int(player.getCurrentPosition())
-                if self.btn_play is not None:
-                    self.btn_play.setText("⏸" if bool(player.isPlaying()) else "▶")
-            except Exception:
-                pass
-        self.rebuild_faces(p.lobby_people())
-        if p.is_host():
-            k = p.watching_count()
-            self.status.setText(f"Ты ведёшь · {k} смотр." if k else "Ждём зрителей…")
-        else:
-            self.status.setText(f"{p.host_name()} ведёт · {fmt_time(pos)}")
+    def set_state(self, big, info, show_start=False):
+        self.big.setText(big or "")
+        self.info.setText(info or "")
+        self.center.setVisibility(0 if (big or info or show_start) else 8)
+        self.start_btn.setVisibility(0 if show_start else 8)
+
+    def set_titles(self, title, subtitle):
+        self.title.setText(title)
+        self.subtitle.setText(subtitle)
+
+    def toggle_controls(self):
+        self.controls_shown = not self.controls_shown
+        a = 1.0 if self.controls_shown else 0.0
+        for v in (self.top, self.bottom):
+            v.setVisibility(0)
+            v.animate().alpha(a).setDuration(200).start()
+
+        def hide():
+            if not self.controls_shown:
+                self.top.setVisibility(4)
+                self.bottom.setVisibility(4)
+        if not self.controls_shown:
+            run_on_ui_thread(hide, 220)
+
+    def rotate(self):
+        try:
+            cur = self.act.getRequestedOrientation()
+            self.act.setRequestedOrientation(-1 if cur == 6 else 6)  # SENSOR_LANDSCAPE ↔ как было
+        except Exception as e:
+            self.p.err(f"поворот: {e}")
+
+    # ---------- сообщения ----------
+
+    def send_input(self):
+        t = str(self.input.getText()).strip()
+        if t:
+            self.input.setText("")
+            self.p.say(t)
 
     def bubble(self, who, text, mine=False):
-        if not self.alive or self.mode != "lobby":
+        if not self.alive:
             return
         dp = self.dp
-        t = self.label(f"{who}: {text}", 14.0)
+        t = self.text(f"{who}: {text}", 14.0)
         t.setPadding(dp(12), dp(7), dp(12), dp(8))
-        t.setBackground(self.round(ACCENT if mine else DARKER, dp(16)))
-        lp = self.LinearLayout.LayoutParams(-2, -2)
+        t.setBackground(self.shape(ACCENT if mine else PANEL, dp(16)))
+        lp = self.LL.LayoutParams(-2, -2)
         lp.topMargin = dp(6)
         self.feed.addView(t, lp)
         self.bubbles.append(t)
@@ -371,89 +720,99 @@ class Overlay:
                     self.feed.removeView(t)
                 except Exception:
                     pass
-        run_on_ui_thread(fade, BUBBLE_MS)
+        run_on_ui_thread(fade, 8000)
 
-    def set_controls_visible(self, show):
-        if self.alive and self.controls is not None:
-            self.controls.animate().alpha(1.0 if show else 0.0).setDuration(200).start()
-            self.controls.setClickable(show)
+    # ---------- закрытие ----------
 
-    def remove(self):
+    def close(self):
+        if not self.alive:
+            return
         self.alive = False
         try:
-            parent = self.root.getParent()
-            if parent is not None:
-                parent.removeView(self.root)
+            self.vv.stopPlayback()
+        except Exception:
+            pass
+        try:
+            self.dialog.dismiss()
         except Exception:
             pass
 
+    def on_dismissed(self):
+        self.alive = False
+        try:
+            self.act.setRequestedOrientation(self.prev_orientation)
+        except Exception:
+            pass
+        self.p.on_player_closed(self)
+
+
+# ---------------- плагин ----------------
 
 class WtogetherPlugin(BasePlugin):
 
-    # ---------- жизненный цикл ----------
-
     def on_plugin_load(self):
-        # host:  {"role": "host",  "doc", "guests": {did: {"accepted", "open"}}, "since"}
-        # guest: {"role": "guest", "doc", "host": did, "accepted", "roster": [...], "since"}
+        # host:  {"role": "host",  "doc", "mo", "guests": {did: {"stage", "pc", "seen"}}, "started"}
+        # guest: {"role": "guest", "doc", "mo", "host", "stage", "roster"}
         self.session = None
-        self.remote = None
-        self.remote_at = 0
-        self.bound = None
-        self.overlay = None
+        self.player = None
+        self.remote = None          # последнее состояние ведущего (у зрителя)
+        self.go = None              # запланированный старт (у зрителя)
+        self.offset = 0             # часы ведущего минус мои часы, мс
+        self.best_rtt = None
+        self.last_host_msg = 0
+        self.invites = {}           # (host did, doc) -> id видео в моём чате
         self.talk = []
-        self.quiet_until = 0.0
-        self.seq = 0
         self.seen = set()
         self.errors = []
-        self.hook_count = 0
-        self.last_nag = 0.0
+        self.stats = {"sent": 0, "send_err": 0, "recv": 0, "last_recv": 0}
+        self.to_delete = []
+        self.last_prog = -1
+        self.last_beat = 0.0
+        self.last_ping = 0.0
+        self.nudging = False
+        self.rtts = []              # последние замеры (rtt, сдвиг)
         self.running = True
-        self.pv_class = find_class("org.telegram.ui.PhotoViewer")
 
         self.add_hook("TL_updateNewMessage")
         self.add_hook("TL_updateShortMessage")
+        try:
+            NewMessages.plugin = self
+            self.nc_delegate = NewMessages()
+            get_notification_center().addObserver(self.nc_delegate, NotificationCenter.didReceiveNewMessages)
+        except Exception as e:
+            self.nc_delegate = None
+            self.err(f"NotificationCenter: {e}")
 
-        self.add_menu_item(MenuItemData(
-            menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
-            text="🎬 Смотреть вместе",
-            on_click=self.on_watch_click,
-        ))
-        self.add_menu_item(MenuItemData(
-            menu_type=MenuItemType.CHAT_ACTION_MENU,
-            text="🎬 Wtogether",
-            on_click=lambda ctx: self.open_panel(),
-        ))
-
-        player_cls = find_class("org.telegram.ui.Components.VideoPlayer")
-        if player_cls:
-            for name in ("play", "pause", "seekTo", "setPlaybackSpeed"):
-                self.hook_count += len(self.hook_all_methods(player_cls, name, PlayerHook(self, name)) or [])
-        else:
-            self.err("VideoPlayer не найден")
-        if self.pv_class:
-            self.hook_count += len(self.hook_all_methods(self.pv_class, "toggleActionBar", ActionBarHook(self)) or [])
-        else:
-            self.err("PhotoViewer не найден")
-        self.logger.info(f"Wtogether загружен, хуков: {self.hook_count}")
-        run_on_ui_thread(self.watch, 1000)
+        self.add_menu_item(MenuItemData(menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
+                                        text="🎬 Смотреть вместе", on_click=self.on_watch_click))
+        self.add_menu_item(MenuItemData(menu_type=MenuItemType.CHAT_ACTION_MENU,
+                                        text="🎬 Wtogether", on_click=lambda ctx: self.open_panel()))
+        threading.Timer(DELETE_EVERY, self.flush_deletes).start()
+        self.logger.info("Wtogether 2.0 загружен")
 
     def on_plugin_unload(self):
         self.running = False
-        run_on_ui_thread(self.close_overlay)
+        try:
+            if self.nc_delegate is not None:
+                get_notification_center().removeObserver(self.nc_delegate, NotificationCenter.didReceiveNewMessages)
+        except Exception:
+            pass
+        if self.player is not None:
+            run_on_ui_thread(self.player.close)
+
+    # ---------- общее ----------
 
     def err(self, text):
-        self.logger.error(text)
+        self.logger.error(str(text))
         self.errors.append(time.strftime("%H:%M:%S ") + str(text))
-        self.errors = self.errors[-15:]
+        self.errors = self.errors[-20:]
 
     def safe(self, fn):
         try:
             fn()
         except Exception as e:
-            self.err(f"кнопка: {e}")
-            BulletinHelper.show_error("Ошибка, подробности в «Проверка работы»")
-
-    # ---------- роли ----------
+            self.err(f"действие: {e}")
+            BulletinHelper.show_error("Ошибка — подробности в «Проверка работы»")
 
     def is_host(self):
         return bool(self.session) and self.session["role"] == "host"
@@ -461,437 +820,27 @@ class WtogetherPlugin(BasePlugin):
     def is_guest(self):
         return bool(self.session) and self.session["role"] == "guest"
 
-    def peer_dids(self):
+    def peers(self):
         if self.is_host():
             return list(self.session["guests"].keys())
         if self.is_guest():
             return [self.session["host"]]
         return []
 
-    def host_name(self):
-        return self.friend_name(self.session["host"]) if self.is_guest() else self.my_name()
-
-    def watching_count(self):
-        return sum(1 for g in self.session["guests"].values() if g.get("open")) if self.is_host() else 0
-
-    def lobby_people(self):
-        """Кого показывать в «головах»: [(user, имя, цвет точки, корона)]."""
-        if not self.session:
-            return []
-        if self.is_host():
-            people = [(self.me_user(), self.my_name(), ONLINE, True)]
-            for did, g in self.session["guests"].items():
-                color = ONLINE if g.get("open") else (OFFLINE if g.get("accepted") else WAITING)
-                people.append((self.user(did), self.friend_name(did), color, False))
-            return people
-        host = self.session["host"]
-        people = [(self.user(host), self.friend_name(host), ONLINE, True)]
-        my_uid = self.my_uid()
-        for r in self.session.get("roster") or []:
-            uid = int(r.get("u") or 0)
-            if uid and uid == my_uid:
-                continue
-            people.append((self.user(uid) if uid else None, r.get("n") or "?",
-                           ONLINE if r.get("o") else OFFLINE, False))
-        people.append((self.me_user(), self.my_name(), ONLINE, False))
-        return people
-
-    # ---------- настройки, панель, проверка ----------
-
-    def create_settings(self):
-        items = [Header(text="Сейчас")]
-        if self.session:
-            items.append(Text(text=self.status_title(), subtext=self.status_text().replace("\n", " · "),
-                              icon="msg_info", on_click=lambda v: self.open_panel()))
-            if self.talk:
-                items.append(Text(text=f"Отправить обсуждение в чат ({len(self.talk)})", accent=True,
-                                  on_click=lambda v: self.send_talk()))
-            items.append(Text(text="Закончить просмотр" if self.is_host() else "Выйти из лобби", red=True,
-                              on_click=lambda v: self.stop_session(reload=True)))
-        else:
-            items.append(Text(text="Совместный просмотр не идёт",
-                              subtext="Открой видео в личке и нажми «🎬 Смотреть вместе»"))
-        items += [
-            Divider(),
-            Header(text="Экран просмотра"),
-            Switch(key="show_start", text="Кнопка «Смотреть вместе» на видео", default=True,
-                   subtext="Появляется на любом видео в личных чатах"),
-            Switch(key="controls", text="Кнопки управления", default=True,
-                   subtext="Ведущий: −10 с, ▶/⏸, +10 с. У всех: сообщение и звонок"),
-            Switch(key="notify", text="Уведомления о действиях", default=True,
-                   subtext="Кто подключился, пауза, перемотка"),
-            Divider(),
-            Header(text="Обсуждение"),
-            Switch(key="send_talk", text="Отправлять обсуждение в чат", default=True,
-                   subtext="Когда ведущий заканчивает просмотр, сообщения уходят в чаты одним сообщением"),
-            Switch(key="ask_invite", text="Спрашивать перед подключением", default=True,
-                   subtext="Окно «Смотреть / Отказаться», когда зовут смотреть"),
-            Divider(),
-            Header(text="Как пользоваться"),
-            Text(text="1. Позови друга",
-                 subtext="Открой видео в личке → «🎬 Смотреть вместе». Ты станешь ведущим 👑"),
-            Text(text="2. Ещё зрители",
-                 subtext="Перешли это же видео другому другу и нажми «Смотреть вместе» в его чате"),
-            Text(text="3. Смотрите",
-                 subtext="Управляет только ведущий. Нажми на аватарки — увидишь всех участников"),
-            Divider(),
-            Text(text="🛠 Проверка работы", subtext="Если кнопки не появляются — нажми и пришли скриншот",
-                 on_click=lambda v: self.diagnostics()),
-            Divider(text="Плагин нужен у всех участников"),
-        ]
-        return items
-
-    def status_title(self):
-        if not self.session:
-            return "Совместный просмотр не идёт"
-        if self.is_host():
-            n = len(self.session["guests"])
-            return f"👑 Ты ведёшь · зрителей: {n}"
-        return f"Смотришь с {self.host_name()} 👑"
-
-    def status_text(self):
-        if not self.session:
-            return ""
-        lines = []
-        if self.is_host():
-            for did, g in self.session["guests"].items():
-                name = self.friend_name(did)
-                if g.get("open"):
-                    lines.append(f"🟢 {name} — смотрит")
-                elif g.get("accepted"):
-                    lines.append(f"⚪ {name} — ещё не открыл(а) видео")
-                else:
-                    lines.append(f"⏳ {name} — не ответил(а)")
-        else:
-            lines.append(f"👑 Ведёт: {self.host_name()}")
-            others = [r.get("n") for r in self.session.get("roster") or [] if int(r.get("u") or 0) != self.my_uid()]
-            if others:
-                lines.append("Ещё смотрят: " + ", ".join(o for o in others if o))
-            if self.remote:
-                lines.append(("▶️ играет с " if self.remote["p"] else "⏸ пауза на ") + fmt_time(self.remote["pos"]))
-            lines.append("Управлять видео может только ведущий")
-        if self.talk:
-            lines.append(f"💬 сообщений в обсуждении: {len(self.talk)}")
-        return "\n".join(lines)
+    def room_now(self):
+        return now_ms() + (self.offset if self.is_guest() else 0)
 
     def activity(self):
-        try:
-            pv, _, _ = self.viewer()
-            if pv is not None:
-                act = get_private_field(pv, "parentActivity")
-                if act is not None:
-                    return act
-        except Exception:
-            pass
+        if self.player is not None and self.player.alive:
+            return self.player.act
         frag = get_last_fragment()
         return frag.getParentActivity() if frag else None
 
-    def dialog(self, title, message, positive=None, negative=None, neutral=None, red_negative=False,
-               view=None, items=None):
-        """Окно. Кнопки — (текст, функция или None). items — (список, функция(index))."""
-        def ui():
-            act = self.activity()
-            if act is None:
-                BulletinHelper.show_info(f"{title}. {message or ''}")
-                return
-            b = AlertDialogBuilder(act)
-            b.set_title(title)
-            if message:
-                b.set_message(message)
-            if view is not None:
-                b.set_view(view(act))
-            if items is not None:
-                labels, pick = items
-
-                def on_item(builder, index):
-                    builder.dismiss()
-                    self.safe(lambda: pick(int(index)))
-                b.set_items(labels, on_item)
-
-            def wrap(fn):
-                def cb(builder, which):
-                    builder.dismiss()
-                    if fn:
-                        self.safe(fn)
-                return cb
-
-            if positive:
-                b.set_positive_button(positive[0], wrap(positive[1]))
-            if negative:
-                b.set_negative_button(negative[0], wrap(negative[1]))
-            if neutral:
-                b.set_neutral_button(neutral[0], wrap(neutral[1]))
-            b.show()
-            if red_negative and negative:
-                try:
-                    b.make_button_red(AlertDialogBuilder.BUTTON_NEGATIVE)
-                except Exception:
-                    pass
-        run_on_ui_thread(ui)
-
-    def open_panel(self):
-        if not self.session:
-            self.dialog("🎬 Wtogether",
-                        "Совместный просмотр не идёт.\n\n"
-                        "Открой видео в личке и нажми «🎬 Смотреть вместе» внизу экрана "
-                        "(или долгое нажатие на видео → Плагины → «Смотреть вместе»).",
-                        positive=("Понятно", None))
-            return
-        neutral = (f"В чат ({len(self.talk)})", self.send_talk) if self.talk else ("Закрыть", None)
-        if self.is_host():
-            self.dialog(self.status_title(), self.status_text() +
-                        "\n\nЧтобы позвать ещё: перешли видео другу и нажми «Смотреть вместе» в его чате.",
-                        positive=("Синхронизировать всех", self.resync),
-                        negative=("Закончить", lambda: self.stop_session()),
-                        neutral=neutral, red_negative=True)
-        else:
-            self.dialog(self.status_title(), self.status_text(),
-                        positive=("Догнать ведущего", self.catch_up),
-                        negative=("Выйти", lambda: self.stop_session()),
-                        neutral=neutral, red_negative=True)
-
-    def diagnostics(self):
-        lines = [f"Версия {__version__}", f"Хуков установлено: {self.hook_count}"]
-        pv = self.pv_class
-        lines.append("PhotoViewer: найден" if pv else "PhotoViewer: НЕ найден")
-        if pv:
-            for f in ("videoPlayer", "currentMessageObject", "containerView", "parentActivity"):
-                try:
-                    pv.getDeclaredField(f)
-                    lines.append(f"  поле {f}: есть")
-                except Exception:
-                    lines.append(f"  поле {f}: НЕТ")
-            names = set(str(m.getName()) for m in pv.getDeclaredMethods())
-            for m in ("getInstance", "hasInstance", "isVisible", "toggleVideoPlayer", "toggleActionBar"):
-                lines.append(f"  метод {m}: {'есть' if m in names else 'НЕТ'}")
-        vp = find_class("org.telegram.ui.Components.VideoPlayer")
-        if vp:
-            names = set(str(m.getName()) for m in vp.getDeclaredMethods())
-            for m in ("play", "pause", "seekTo", "isPlaying", "getCurrentPosition", "getPlaybackSpeed"):
-                lines.append(f"VideoPlayer.{m}: {'есть' if m in names else 'НЕТ'}")
-        else:
-            lines.append("VideoPlayer: НЕ найден")
-        lines.append("Звонки: " + ("есть" if find_class("org.telegram.ui.Components.voip.VoIPHelper") else "НЕТ"))
-        lines.append("Аватарки: " + ("есть" if find_class("org.telegram.ui.Components.BackupImageView") else "НЕТ"))
-        lines.append(f"Слежение за плеером: {'работает' if self.running else 'остановлено'}")
-        lines.append(f"Лобби: {self.session['role'] if self.session else 'нет'}")
-        if self.errors:
-            lines.append("")
-            lines.append("Последние ошибки:")
-            lines += self.errors[-8:]
-        text = "\n".join(lines)
-        self.dialog("🛠 Проверка Wtogether", text,
-                    positive=("Скопировать", lambda: copy_to_clipboard(text)),
-                    negative=("Закрыть", None))
-
-    # ---------- действия ----------
-
-    def on_watch_click(self, context):
-        self.invite_from(context.get("message"))
-
-    def invite_from(self, msg):
-        if msg is None or not msg.isVideo():
-            BulletinHelper.show_error("Выбери сообщение с видео")
-            return
-        did = int(msg.getDialogId())
-        if did <= 0 or did == self.my_uid():
-            BulletinHelper.show_error("Зови из личного чата с другом")
-            return
-        doc = self.doc_of(msg)
-        if not doc:
-            BulletinHelper.show_error("Не удалось распознать видео")
-            return
-        if self.is_guest():
-            self.dialog("Ты сейчас зритель", f"Ты смотришь в лобби у {self.host_name()}. Выйти и начать своё?",
-                        positive=("Выйти и начать", lambda: (self.stop_session(), self.invite_from(msg))),
-                        negative=("Отмена", None))
-            return
-        if self.is_host() and self.session["doc"] != doc:
-            self.dialog("Идёт другой просмотр", "Закончить текущее лобби и начать с этим видео?",
-                        positive=("Да", lambda: (self.stop_session(), self.invite_from(msg))),
-                        negative=("Отмена", None))
-            return
-        if not self.session:
-            self.session = {"role": "host", "doc": doc, "guests": {}, "since": now_ms()}
-            self.remote = None
-            self.talk = []
-        guests = self.session["guests"]
-        if did in guests and guests[did].get("accepted"):
-            BulletinHelper.show_info(f"{self.friend_name(did)} уже в лобби")
-            return
-        if len(guests) >= MAX_GUESTS and did not in guests:
-            BulletinHelper.show_error(f"В лобби уже {MAX_GUESTS} зрителей")
-            return
-        guests[did] = {"accepted": False, "open": False}
-        text = (f"🎬 {self.my_name()} зовёт смотреть это видео вместе!\n"
-                "Открой его — ведущий управляет, а ты смотришь синхронно.\n"
-                "Нужен плагин Wtogether для exteraGram." + zw_encode({"t": "invite", "d": doc}))
-        try:
-            send_text(did, text, replyToMsg=msg)
-        except Exception:
-            send_text(did, text)
-        BulletinHelper.show_success(f"👑 Ты ведущий. Приглашение отправлено {self.friend_name(did)}")
-        self.bound = None
-        self.close_overlay()
-
-    def how_to_add(self):
-        self.dialog("➕ Позвать ещё",
-                    "Перешли это видео другу в личку, открой его там и нажми «Смотреть вместе» "
-                    "(или долгое нажатие → Плагины → «Смотреть вместе»).\n\n"
-                    "Друг попадёт в это же лобби, а ты увидишь его аватарку.",
-                    positive=("Понятно", None))
-
-    def resync(self):
-        if not self.is_host() or self.session_player()[1] is None:
-            BulletinHelper.show_error("Сначала открой видео")
-            return
-        run_on_ui_thread(lambda: self.send_state(force=True))
-        BulletinHelper.show_success("Все зрители перемотаны к тебе")
-
-    def catch_up(self):
-        if not self.is_guest():
-            return
-        self.send_cmd({"t": "ask"})
-        if self.remote:
-            run_on_ui_thread(self.apply_remote)
-        BulletinHelper.show_info("Догоняю ведущего…")
-
-    def play_pause(self):
-        pv, player, _ = self.session_player()
-        if player is not None and self.is_host():
-            self.toggle(pv, player, not bool(player.isPlaying()))
-
-    def skip(self, delta):
-        pv, player, _ = self.session_player()
-        if player is None or not self.is_host():
-            return
-        try:
-            dur = int(player.getDuration())
-        except Exception:
-            dur = 0
-        pos = max(0, int(player.getCurrentPosition()) + delta)
-        if dur > 0:
-            pos = min(pos, dur - 500)
-        player.seekTo(pos)
-
-    def compose_message(self):
-        if not self.session:
-            return
-        holder = {}
-
-        def make_view(act):
-            from android.widget import EditText
-            e = EditText(act)
-            e.setHint("Что думаешь об этом моменте?")
-            e.setMaxLines(4)
-            try:
-                from org.telegram.ui.ActionBar import Theme
-                e.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
-                e.setHintTextColor(Theme.getColor(Theme.key_dialogTextHint))
-            except Exception:
-                pass
-            try:
-                from org.telegram.messenger import AndroidUtilities
-                pad = AndroidUtilities.dp(22.0)
-                e.setPadding(pad, pad // 2, pad, pad // 2)
-            except Exception:
-                pass
-            holder["edit"] = e
-            return e
-
-        def send():
-            e = holder.get("edit")
-            text = str(e.getText()).strip() if e is not None else ""
-            if text:
-                self.say(text)
-
-        self.dialog(f"💬 Сообщение на {fmt_time(self.current_pos())}", None,
-                    positive=("Отправить", send), negative=("Отмена", None), view=make_view)
-
-    def current_pos(self):
-        pv, player, _ = self.session_player()
-        try:
-            return int(player.getCurrentPosition()) if player is not None else 0
-        except Exception:
-            return 0
-
-    def say(self, text):
-        text = text[:300]
-        at = self.current_pos()
-        self.talk.append((at, self.my_name(), text))
-        self.send_cmd({"t": "msg", "x": text, "at": at, "n": self.my_name(), "u": self.my_uid()})
-        run_on_ui_thread(lambda: self.overlay and self.overlay.bubble("Я", text, mine=True))
-
-    def start_call(self):
-        dids = self.peer_dids()
-        if not dids:
-            return
-        if len(dids) == 1:
-            self.call(dids[0])
-            return
-        self.dialog("📞 Кому позвонить?", None, items=([self.friend_name(d) for d in dids],
-                                                      lambda i: self.call(dids[i])),
-                    negative=("Отмена", None))
-
-    def call(self, did):
-        try:
-            from org.telegram.ui.Components.voip import VoIPHelper
-            from org.telegram.messenger import AccountInstance, UserConfig
-            mc = get_messages_controller()
-            user = mc.getUser(Long(did))
-            full = mc.getUserFull(Long(did))
-            can_video = bool(full is not None and full.video_calls_available)
-            VoIPHelper.startCall(user, False, can_video, self.activity(), full,
-                                 AccountInstance.getInstance(UserConfig.selectedAccount))
-            self.send_cmd({"t": "voice"}, to=did)
-        except Exception as e:
-            self.err(f"звонок: {e}")
-            BulletinHelper.show_error("Не удалось начать звонок. Позвони из профиля друга")
-
-    def send_talk(self):
-        if not self.session or not self.talk:
-            return
-        lines = [f"{fmt_time(at)} {who}: {text}" for at, who, text in sorted(self.talk, key=lambda x: x[0])]
-        body = "🎬 Обсуждали видео вместе:\n\n" + "\n".join(lines)
-        if len(body) > 4000:
-            body = body[:3990] + "…"
-        for did in self.peer_dids():
-            send_text(did, body)
-        self.talk = []
-        BulletinHelper.show_success("Обсуждение отправлено в чат")
-
-    def stop_session(self, reload=False):
-        if not self.session:
-            return
-        if self.is_host():
-            if self.talk and self.get_setting("send_talk", True):
-                self.send_talk()
-            self.send_cmd({"t": "stop"})
-            BulletinHelper.show_info("Просмотр закончен")
-        else:
-            self.send_cmd({"t": "leave"})
-            BulletinHelper.show_info("Ты вышел(ла) из лобби")
-        self.clear_session()
-        if reload:
-            self.set_setting("_state", now_ms(), reload_settings=True)
-
-    def clear_session(self):
-        self.session = None
-        self.remote = None
-        self.bound = None
-        self.talk = []
-        run_on_ui_thread(self.close_overlay)
-
-    def roster(self):
-        out = []
-        for did, g in self.session["guests"].items():
-            if g.get("accepted"):
-                out.append({"u": did, "n": self.friend_name(did), "o": bool(g.get("open"))})
-        return out
-
-    def send_roster(self):
-        if self.is_host():
-            self.send_cmd({"t": "roster", "m": self.roster()})
+    def notify(self, text):
+        if self.player is not None and self.player.alive:
+            self.player.bubble("Wtogether", text)
+        elif self.get_setting("notify", True):
+            BulletinHelper.show_info(text)
 
     # ---------- пользователи ----------
 
@@ -919,229 +868,556 @@ class WtogetherPlugin(BasePlugin):
         except Exception:
             return None
 
-    def friend_name(self, did):
+    def name(self, did):
         u = self.user(did)
-        if u is not None and u.first_name:
-            return u.first_name
-        return "друг"
+        return u.first_name if u is not None and u.first_name else "друг"
 
-    def notify(self, text):
-        if self.get_setting("notify", True):
-            BulletinHelper.show_info(text)
+    def host_name(self):
+        return self.name(self.session["host"]) if self.is_guest() else self.my_name()
 
-    # ---------- слежение за просмотрщиком ----------
+    STAGE_DOT = {"ready": ONLINE, "watching": ONLINE, "loading": WAITING, "joined": WAITING,
+                 "invited": OFFLINE}
 
-    def doc_of(self, msg):
+    def lobby_people(self):
+        if not self.session:
+            return []
+        if self.is_host():
+            out = [(self.me_user(), self.my_name(), ONLINE, True)]
+            for did, g in self.session["guests"].items():
+                out.append((self.user(did), self.name(did), self.STAGE_DOT.get(g["stage"], OFFLINE), False))
+            return out
+        out = [(self.user(self.session["host"]), self.host_name(),
+                ONLINE if now_ms() - self.last_host_msg < 30000 else OFFLINE, True)]
+        me = self.my_uid()
+        for r in self.session.get("roster") or []:
+            uid = int(r.get("u") or 0)
+            if uid and uid != me:
+                out.append((self.user(uid), r.get("n") or "?", self.STAGE_DOT.get(r.get("s"), OFFLINE), False))
+        out.append((self.me_user(), self.my_name(), ONLINE, False))
+        return out
+
+    # ---------- видеофайл ----------
+
+    def doc_of(self, mo):
         try:
-            doc = msg.getDocument()
-            return int(doc.id) if doc is not None else 0
+            d = mo.getDocument()
+            return int(d.id) if d is not None else 0
         except Exception:
             return 0
 
-    def viewer(self):
-        """Открытый просмотрщик Telegram, его плеер и текущее сообщение."""
+    def local_path(self, mo):
+        from java.io import File
         try:
-            PhotoViewer = self.pv_class
-            if PhotoViewer is None:
-                return None, None, None
-            try:
-                if not PhotoViewer.getDeclaredMethod("hasInstance").invoke(None):
-                    return None, None, None
-            except Exception:
-                pass
-            pv = PhotoViewer.getDeclaredMethod("getInstance").invoke(None)
-            if pv is None:
-                return None, None, None
-            try:
-                if not pv.isVisible():
-                    return None, None, None
-            except Exception:
-                pass
-            return pv, get_private_field(pv, "videoPlayer"), get_private_field(pv, "currentMessageObject")
-        except Exception as e:
-            self.err(f"viewer: {e}")
-            return None, None, None
-
-    def matches(self, msg):
-        if not self.session or msg is None or self.doc_of(msg) != self.session["doc"]:
-            return False
-        if self.is_guest():
-            return int(msg.getDialogId()) == self.session["host"]
-        return True
-
-    def session_player(self):
-        pv, player, msg = self.viewer()
-        if player is None or not self.matches(msg):
-            return None, None, None
-        return pv, player, msg
-
-    def watch(self):
-        if not self.running:
-            return
-        try:
-            self.check_viewer()
-        except Exception as e:
-            self.err(f"watch: {e}")
-        run_on_ui_thread(self.watch, WATCH_MS)
-
-    def check_viewer(self):
-        pv, player, msg = self.viewer()
-        if pv is None or msg is None or not msg.isVideo():
-            if self.overlay is not None or self.bound is not None:
-                self.bound = None
-                self.close_overlay()
-            return
-        if self.session and self.matches(msg) and player is not None:
-            if self.bound is None or not self.bound.equals(player):
-                self.bound = player
-                self.on_video_opened()
-            self.ensure_overlay(pv, "lobby", msg)
-            if self.overlay is not None:
-                self.overlay.update()
-            return
-        self.bound = None
-        did = int(msg.getDialogId())
-        if (not self.session and did > 0 and did != self.my_uid()
-                and self.get_setting("show_start", True)):
-            self.ensure_overlay(pv, "start", msg)
-        else:
-            self.close_overlay()
-
-    def ensure_overlay(self, pv, mode, msg):
-        key = (int(msg.getDialogId()), int(msg.getId()))
-        o = self.overlay
-        if o is not None and o.alive and o.mode == mode and (mode == "lobby" or o.msg_key == key):
-            return
-        self.close_overlay()
-        try:
-            self.overlay = Overlay(self, pv, mode, msg)
-        except Exception as e:
-            self.overlay = None
-            self.err(f"overlay: {e}")
-
-    def close_overlay(self):
-        if self.overlay is not None:
-            self.overlay.remove()
-            self.overlay = None
-
-    def set_controls_visible(self, show):
-        if self.overlay is not None:
-            self.overlay.set_controls_visible(show)
-
-    # ---------- синхронизация ----------
-
-    def on_video_opened(self):
-        self.quiet_until = time.time() + QUIET
-        if self.is_guest():
-            if not self.session.get("accepted"):
-                self.session["accepted"] = True
-                self.send_cmd({"t": "accept"})
-            self.send_cmd({"t": "ask"})
-            if self.remote:
-                run_on_ui_thread(self.apply_remote, 800)
-        else:
-            run_on_ui_thread(lambda: self.send_state(force=True), 900)
-
-    def on_player_event(self, player, name):
-        if not self.session or self.bound is None or not self.bound.equals(player):
-            return
-        if time.time() < self.quiet_until:
-            return
-        self.seq += 1
-        s = self.seq
-        if self.is_host():
-            threading.Timer(SEND_DELAY, lambda: run_on_ui_thread(lambda: self.send_state(seq=s))).start()
-        else:
-            threading.Timer(SEND_DELAY, lambda: run_on_ui_thread(lambda: self.revert(s))).start()
-
-    def revert(self, seq):
-        """Зритель сам нажал паузу или перемотал — возвращаем к ведущему."""
-        if seq != self.seq or not self.is_guest():
-            return
-        if self.remote:
-            self.apply_remote()
-        else:
-            self.send_cmd({"t": "ask"})
-        if time.time() - self.last_nag > 6:
-            self.last_nag = time.time()
-            BulletinHelper.show_info(f"👑 Видео управляет {self.host_name()}")
-
-    def read_state(self):
-        pv, player, _ = self.session_player()
-        if player is None:
-            return None
-        try:
-            playing = bool(player.isPlaying())
-            pos = int(player.getCurrentPosition())
-        except Exception as e:
-            self.err(f"read_state: {e}")
-            return None
-        try:
-            rate = float(player.getPlaybackSpeed())
+            ap = mo.messageOwner.attachPath
+            if ap and File(ap).exists() and File(ap).length() > 0:
+                return str(ap)
         except Exception:
-            rate = 1.0
-        return {"p": playing, "pos": pos, "r": rate, "ts": now_ms()}
-
-    def send_state(self, seq=None, force=False, to=None):
-        if not self.is_host() or (seq is not None and seq != self.seq):
-            return
-        if not force and time.time() < self.quiet_until:
-            return
-        st = self.read_state()
-        if st:
-            st["t"] = "st"
-            self.send_cmd(st, to=to)
-
-    def apply_remote(self):
-        st = self.remote
-        pv, player, _ = self.session_player()
-        if not st or player is None:
-            return
-        self.quiet_until = time.time() + QUIET
-        elapsed = min(max(0, now_ms() - st["ts"]), 60000)
-        target = st["pos"] + (elapsed * st["r"] if st["p"] else 0)
+            pass
         try:
+            f = get_file_loader().getPathToMessage(mo.messageOwner)
+            if f is not None and f.exists() and f.length() > 0:
+                return str(f.getAbsolutePath())
+        except Exception as e:
+            self.err(f"путь к файлу: {e}")
+        return None
+
+    def download(self, mo):
+        try:
+            get_file_loader().loadFile(mo.getDocument(), mo, 3, 0)
+        except Exception as e:
+            self.err(f"загрузка: {e}")
+
+    def download_percent(self, mo):
+        try:
+            from java.io import File
+            from org.telegram.messenger import FileLoader
+            doc = mo.getDocument()
+            name = FileLoader.getAttachFileName(doc)
+            tmp = File(get_file_loader().getDirectory(4), name + ".temp")
+            if tmp.exists() and doc.size > 0:
+                return max(0, min(99, int(tmp.length() * 100 / doc.size)))
+        except Exception:
+            pass
+        return 0
+
+    def report_progress(self, pc):
+        if self.is_guest() and pc // 20 != self.last_prog // 20:
+            self.last_prog = pc
+            self.send({"t": "prog", "pc": pc})
+
+    # ---------- начало ----------
+
+    def on_watch_click(self, context):
+        self.safe(lambda: self.watch_message(context.get("message")))
+
+    def watch_message(self, mo):
+        if mo is None or not mo.isVideo():
+            BulletinHelper.show_error("Выбери сообщение с видео")
+            return
+        did = int(mo.getDialogId())
+        if did <= 0 or did == self.my_uid():
+            BulletinHelper.show_error("Зови из личного чата с другом")
+            return
+        doc = self.doc_of(mo)
+        if (did, doc) in self.invites and not self.is_host():
+            self.join(did, doc, mo)  # видео из приглашения — входим зрителем
+            return
+        if self.is_guest():
+            self.confirm("Ты сейчас зритель", f"Выйти из просмотра у {self.host_name()} и начать свой?",
+                         "Начать свой", lambda: (self.end(), self.watch_message(mo)))
+            return
+        if self.is_host() and self.session["doc"] != doc:
+            self.confirm("Идёт другой просмотр", "Закончить текущий и начать с этим видео?",
+                         "Начать", lambda: (self.end(), self.watch_message(mo)))
+            return
+        if not self.session:
+            self.session = {"role": "host", "doc": doc, "mo": mo, "guests": {}, "started": False}
+            self.remote = None
+            self.talk = []
+        g = self.session["guests"]
+        if did not in g:
+            if len(g) >= MAX_GUESTS:
+                BulletinHelper.show_error(f"Уже {MAX_GUESTS} зрителей")
+                return
+            g[did] = {"stage": "invited", "pc": 0, "seen": 0}
+            text = (f"🎬 {self.my_name()} зовёт смотреть это видео вместе!\n"
+                    "Нажми «Смотреть» во всплывшем окне — откроется общий плеер.\n"
+                    "Нужен плагин Wtogether для exteraGram." + zw_encode({"t": "invite", "d": doc}))
             try:
-                if abs(float(player.getPlaybackSpeed()) - st["r"]) > 0.01:
-                    player.setPlaybackSpeed(float(st["r"]))
+                send_text(did, text, replyToMsg=mo)
             except Exception:
-                pass
-            if abs(int(player.getCurrentPosition()) - target) > DRIFT_MS:
-                player.seekTo(int(target))
-            if bool(player.isPlaying()) != st["p"]:
-                self.toggle(pv, player, st["p"])
-        except Exception as e:
-            self.err(f"apply_remote: {e}")
+                send_text(did, text)
+            BulletinHelper.show_success(f"👑 Приглашение отправлено {self.name(did)}")
+        self.open_player(mo)
 
-    def toggle(self, pv, player, want_play):
+    def open_player(self, mo):
+        if self.player is not None and self.player.alive:
+            return
         try:
-            m = self.pv_class.getDeclaredMethod("toggleVideoPlayer")
-            m.setAccessible(True)
-            m.invoke(pv)
-            return
+            self.player = Player(self, mo)
+            self.update_ui()
         except Exception as e:
-            self.logger.info(f"toggleVideoPlayer недоступен: {e}")
-        if want_play:
-            player.play()
-        else:
-            player.pause()
+            self.player = None
+            self.err(f"открыть плеер: {e}")
+            BulletinHelper.show_error("Не удалось открыть плеер — см. «Проверка работы»")
 
-    # ---------- служебные сообщения ----------
+    def join(self, host, doc, mo):
+        if self.session and not (self.is_guest() and self.session["host"] == host):
+            self.end()
+        self.session = {"role": "guest", "doc": doc, "mo": mo, "host": host, "stage": "joined", "roster": []}
+        self.remote = None
+        self.go = None
+        self.talk = []
+        self.offset = 0
+        self.best_rtt = None
+        self.rtts = []
+        self.nudging = False
+        self.last_ping = time.time()
+        self.last_prog = -1
+        self.send({"t": "join"})
+        for i in range(3):
+            threading.Timer(0.3 + i * 1.2, lambda: self.send({"t": "ping", "a": now_ms()})).start()
+        run_on_ui_thread(lambda: self.open_player(mo))
 
-    def human(self, cmd):
-        t = cmd.get("t")
-        if t == "st":
-            return ("▶️ смотрим с " if cmd["p"] else "⏸ пауза на ") + fmt_time(cmd["pos"])
-        if t == "msg":
-            return "💬 " + cmd.get("x", "")
-        return {"ask": "🔄 подключаюсь", "stop": "⏹ просмотр закончен", "voice": "📞 звоню",
-                "leave": "👋 вышел(ла) из лобби", "roster": "👥 участники",
-                "accept": "✅ принял(а) приглашение", "decline": "🙅 отказался(ась)"}.get(t, t or "")
-
-    def send_cmd(self, cmd, to=None):
-        if not self.session and to is None:
+    def join_from_invite(self, host, doc, reply_id):
+        """Находим видео из приглашения в своём чате и открываем плеер."""
+        if not reply_id:
+            BulletinHelper.show_info("Долгое нажатие на видео над приглашением → Плагины → «Смотреть вместе»")
             return
-        targets = [to] if to else self.peer_dids()
+        try:
+            req = TLRPC.TL_messages_getMessages()
+            iid = TLRPC.TL_inputMessageID()
+            iid.id = int(reply_id)
+            req.id.add(iid)
+
+            def done(resp, error):
+                try:
+                    if error is not None or resp is None or resp.messages.size() == 0:
+                        raise RuntimeError(getattr(error, "text", "нет сообщения"))
+                    from org.telegram.messenger import UserConfig
+                    mo = MessageObject(UserConfig.selectedAccount, resp.messages.get(0), False, False)
+                    run_on_ui_thread(lambda: self.safe(lambda: self.join(host, doc, mo)))
+                except Exception as e:
+                    self.err(f"видео из приглашения: {e}")
+                    BulletinHelper.show_info("Долгое нажатие на видео над приглашением → Плагины → «Смотреть вместе»")
+            send_request(req, done)
+        except Exception as e:
+            self.err(f"getMessages: {e}")
+
+    # ---------- ведущий ----------
+
+    def host_start(self):
+        if not self.is_host() or self.player is None or not self.player.prepared:
+            return
+        pos = self.player.position()
+        at = now_ms() + COUNTDOWN_MS
+        self.session["started"] = True
+        self.send({"t": "go", "pos": pos, "at": at, "r": self.player.speed or 1.0})
+        self.player.countdown_at = at
+        self.update_ui()
+
+    def host_state(self):
+        pl = self.player
+        return {"t": "st", "p": pl.playing(), "pos": pl.position(), "r": pl.speed or 1.0, "ts": now_ms()}
+
+    def broadcast_state(self, to=None):
+        if self.is_host() and self.player is not None and self.player.prepared:
+            self.send(self.host_state(), to=to)
+            self.last_beat = time.time()
+
+    def host_toggle(self):
+        pl = self.player
+        if not self.is_host() or pl is None or not pl.prepared:
+            return
+        if not self.session["started"]:
+            self.host_start()
+            return
+        if pl.playing():
+            pl.pause()
+        else:
+            pl.play()
+        self.broadcast_state()
+
+    def host_skip(self, delta):
+        pl = self.player
+        if self.is_host() and pl is not None and pl.prepared:
+            pl.seek_to(pl.position() + delta)
+            run_on_ui_thread(self.broadcast_state, 250)
+
+    def host_seek(self, ms):
+        pl = self.player
+        if self.is_host() and pl is not None and pl.prepared:
+            pl.seek_to(ms)
+            run_on_ui_thread(self.broadcast_state, 250)
+
+    def host_speed(self):
+        pl = self.player
+        if not self.is_host() or pl is None:
+            return
+        cur = pl.speed or 1.0
+        nxt = SPEEDS[(SPEEDS.index(cur) + 1) % len(SPEEDS)] if cur in SPEEDS else 1.0
+        if not pl.playing():
+            BulletinHelper.show_info("Скорость меняется во время воспроизведения")
+            return
+        pl.set_speed(nxt)
+        if pl.btn_speed is not None:
+            pl.btn_speed.setText(f"{nxt:g}×")
+        self.broadcast_state()
+
+    def on_completed(self):
+        if self.is_host():
+            self.broadcast_state()
+            self.notify("Видео закончилось")
+
+    def send_roster(self):
+        if not self.is_host():
+            return
+        m = [{"u": d, "n": self.name(d), "s": g["stage"]} for d, g in self.session["guests"].items()
+             if g["stage"] != "invited"]
+        self.send({"t": "roster", "m": m})
+
+    # ---------- зритель ----------
+
+    def catch_up(self):
+        if self.is_guest():
+            self.send({"t": "ask"})
+            if self.player is not None:
+                self.player.seek_block_until = 0
+            BulletinHelper.show_info("Догоняю ведущего…")
+
+    def on_player_ready(self):
+        if self.is_guest():
+            self.session["stage"] = "ready"
+            self.send({"t": "ready"})
+        self.update_ui()
+
+    # ---------- цикл плеера ----------
+
+    def on_tick(self, pl):
+        if not self.session:
+            return
+        if self.is_host():
+            if pl.countdown_at:
+                left = pl.countdown_at - now_ms()
+                if left <= 0:
+                    pl.countdown_at = 0
+                    pl.play()
+                    self.broadcast_state()
+                    self.update_ui()
+                else:
+                    pl.set_state(str(left // 1000 + 1), "Старт для всех", False)
+            elif pl.playing() and time.time() - getattr(self, "last_beat", 0) > HEARTBEAT_S:
+                self.broadcast_state()
+            self.update_titles()
+            return
+
+        # зритель
+        if not pl.prepared:
+            self.update_titles()
+            return
+        if self.go:
+            left = self.go["at"] - self.room_now()
+            if left > 0:
+                pl.set_state(str(left // 1000 + 1), "Старт для всех", False)
+                if abs(pl.position() - self.go["pos"]) > SMALL_DRIFT and time.time() > pl.seek_block_until:
+                    pl.seek_to(self.go["pos"])
+                self.update_titles()
+                return
+            self.remote = {"p": True, "pos": self.go["pos"], "r": self.go["r"], "ts": self.go["at"]}
+            self.go = None
+            self.update_ui()
+        st = self.remote
+        if st is None:
+            pl.pause()
+            self.update_titles()
+            return
+        if time.time() - self.last_ping > PING_EVERY:
+            self.last_ping = time.time()
+            self.send({"t": "ping", "a": now_ms()})
+        play, seek, speed, self.nudging = plan_correction(st, self.room_now(), pl.position(),
+                                                          pl.playing(), self.nudging)
+        if seek is not None and time.time() > pl.seek_block_until:
+            pl.seek_to(seek)
+        if play:
+            pl.play()
+            pl.set_speed(speed)
+        else:
+            pl.pause()
+        self.update_titles()
+
+    def update_titles(self):
+        pl = self.player
+        if pl is None or not pl.alive or not self.session:
+            return
+        if self.is_host():
+            g = self.session["guests"]
+            ready = sum(1 for x in g.values() if x["stage"] in ("ready", "watching"))
+            pl.set_titles("👑 Ты ведёшь", f"готовы {ready} из {len(g)}" if g else "ждём зрителей")
+        else:
+            ago = (now_ms() - self.last_host_msg) // 1000 if self.last_host_msg else None
+            link = "на связи" if ago is not None and ago < 30 else ("нет связи" if ago is not None else "подключаюсь")
+            pl.set_titles(f"👑 Ведёт {self.host_name()}", link)
+
+    def update_ui(self):
+        pl = self.player
+        if pl is None or not pl.alive or not self.session:
+            return
+        if not pl.prepared:
+            return
+        if self.is_host():
+            if not self.session["started"]:
+                lines = []
+                for did, g in self.session["guests"].items():
+                    st = {"invited": "не ответил(а)", "joined": "подключается", "ready": "готов(а)",
+                          "watching": "готов(а)",
+                          "loading": f"загружает {g.get('pc', 0)}%"}.get(g["stage"], g["stage"])
+                    lines.append(f"{self.name(did)} — {st}")
+                pl.set_state("👥", "\n".join(lines) or "Ждём зрителей…", True)
+            elif not pl.countdown_at:
+                pl.set_state("", "", False)
+        else:
+            if self.go:
+                return
+            if self.remote is None:
+                pl.set_state("⏳", f"Ждём, когда {self.host_name()} начнёт", False)
+            else:
+                pl.set_state("", "", False)
+        self.update_titles()
+
+    # ---------- общение ----------
+
+    def say(self, text):
+        text = text[:300]
+        at = self.player.position() if self.player is not None else 0
+        self.talk.append((at, self.my_name(), text))
+        self.send({"t": "msg", "x": text, "at": at, "n": self.my_name(), "u": self.my_uid()})
+        if self.player is not None:
+            self.player.bubble("Я", text, mine=True)
+
+    def start_call(self):
+        dids = self.peers()
+        if not dids:
+            return
+        if len(dids) == 1:
+            self.call(dids[0])
+            return
+        act = self.activity()
+        b = AlertDialogBuilder(act)
+        b.set_title("📞 Кому позвонить?")
+        b.set_items([self.name(d) for d in dids], lambda bb, i: (bb.dismiss(), self.call(dids[int(i)])))
+        b.set_negative_button("Отмена", lambda bb, w: bb.dismiss())
+        b.show()
+
+    def call(self, did):
+        try:
+            from org.telegram.ui.Components.voip import VoIPHelper
+            from org.telegram.messenger import AccountInstance, UserConfig
+            mc = get_messages_controller()
+            full = mc.getUserFull(Long(did))
+            VoIPHelper.startCall(mc.getUser(Long(did)), False,
+                                 bool(full is not None and full.video_calls_available),
+                                 self.activity(), full, AccountInstance.getInstance(UserConfig.selectedAccount))
+        except Exception as e:
+            self.err(f"звонок: {e}")
+            BulletinHelper.show_error("Не удалось начать звонок")
+
+    def send_talk(self):
+        if not self.talk or not self.peers():
+            return
+        lines = [f"{fmt_time(at)} {who}: {t}" for at, who, t in sorted(self.talk, key=lambda x: x[0])]
+        body = "🎬 Обсуждали видео вместе:\n\n" + "\n".join(lines)
+        for did in self.peers():
+            send_text(did, body[:4000])
+        self.talk = []
+
+    # ---------- завершение ----------
+
+    def confirm(self, title, message, yes, fn):
+        def ui():
+            act = self.activity()
+            if act is None:
+                return
+            b = AlertDialogBuilder(act)
+            b.set_title(title)
+            b.set_message(message)
+            b.set_positive_button(yes, lambda bb, w: (bb.dismiss(), self.safe(fn)))
+            b.set_negative_button("Отмена", lambda bb, w: bb.dismiss())
+            b.show()
+        run_on_ui_thread(ui)
+
+    def ask_close(self):
+        if not self.session:
+            if self.player is not None:
+                self.player.close()
+            return
+        if self.is_host():
+            self.confirm("Закончить просмотр?", "Плеер закроется у всех зрителей.", "Закончить", self.end)
+        else:
+            self.confirm("Выйти из просмотра?", f"{self.host_name()} и остальные продолжат без тебя.",
+                         "Выйти", self.end)
+
+    def end(self):
+        if self.is_host():
+            if self.talk and self.get_setting("send_talk", True):
+                self.send_talk()
+            self.send({"t": "stop"})
+        elif self.is_guest():
+            self.send({"t": "leave"})
+        self.session = None
+        self.remote = None
+        self.go = None
+        pl, self.player = self.player, None   # сразу отвязываем, чтобы можно было открыть новый
+        if pl is not None:
+            run_on_ui_thread(pl.close)
+
+    def on_player_closed(self, pl):
+        if self.player is not pl:
+            return            # старый плеер, уже отвязан
+        self.player = None
+        if self.session:      # закрыли не через «Закончить» — считаем, что вышли
+            self.end()
+
+    # ---------- панель и настройки ----------
+
+    def status_text(self):
+        if not self.session:
+            return "Совместный просмотр не идёт.\n\nДолгое нажатие на видео в личке → Плагины → «🎬 Смотреть вместе»."
+        if self.is_host():
+            lines = ["👑 Ты ведёшь просмотр", ""]
+            for did, g in self.session["guests"].items():
+                lines.append(f"{self.name(did)}: {g['stage']}" + (f" {g['pc']}%" if g["stage"] == "loading" else ""))
+            return "\n".join(lines)
+        return f"👑 Ведёт {self.host_name()}\nУправлять видео может только ведущий."
+
+    def open_panel(self):
+        def ui():
+            act = self.activity()
+            if act is None:
+                return
+            b = AlertDialogBuilder(act)
+            b.set_title("🎬 Wtogether")
+            b.set_message(self.status_text())
+            if self.session and self.player is None and self.session.get("mo") is not None:
+                b.set_positive_button("Открыть плеер",
+                                      lambda bb, w: (bb.dismiss(), self.open_player(self.session["mo"])))
+            if self.session:
+                b.set_negative_button("Закончить" if self.is_host() else "Выйти",
+                                      lambda bb, w: (bb.dismiss(), self.safe(self.end)))
+            b.set_neutral_button("Закрыть", lambda bb, w: bb.dismiss())
+            b.show()
+        run_on_ui_thread(ui)
+
+    def create_settings(self):
+        return [
+            Header(text="Wtogether"),
+            Text(text="Статус", subtext=self.status_text().replace("\n", " "), icon="msg_info",
+                 on_click=lambda v: self.open_panel()),
+            Divider(),
+            Header(text="Настройки"),
+            Switch(key="ask_invite", text="Спрашивать перед подключением", default=True,
+                   subtext="Окно «Смотреть / Отказаться», когда зовут смотреть"),
+            Switch(key="send_talk", text="Отправлять обсуждение в чат", default=True,
+                   subtext="Когда ведущий заканчивает, сообщения из плеера уходят в чаты"),
+            Switch(key="notify", text="Уведомления вне плеера", default=True),
+            Divider(),
+            Header(text="Как пользоваться"),
+            Text(text="1. Позови", subtext="Долгое нажатие на видео в личке → Плагины → «Смотреть вместе»"),
+            Text(text="2. Подождите загрузку", subtext="В плеере видно, кто готов. Ведущий жмёт «Начать для всех»"),
+            Text(text="3. Смотрите", subtext="Управляет только ведущий 👑, у остальных всё повторяется само"),
+            Divider(),
+            Text(text="🛠 Проверка работы", subtext="Если что-то не так — нажми и пришли текст",
+                 on_click=lambda v: self.diagnostics()),
+            Divider(text="Плагин нужен у всех участников"),
+        ]
+
+    def diagnostics(self):
+        def has(cls):
+            try:
+                from hook_utils import find_class
+                return "есть" if find_class(cls) else "НЕТ"
+            except Exception:
+                return "?"
+        s = self.stats
+        ago = (now_ms() - s["last_recv"]) // 1000 if s["last_recv"] else None
+        lines = [f"Версия {__version__}",
+                 f"Плеер Android (VideoView): {has('android.widget.VideoView')}",
+                 f"Загрузчик файлов: {'есть' if get_file_loader() is not None else 'НЕТ'}",
+                 f"Приём через NotificationCenter: {'да' if self.nc_delegate else 'нет'}",
+                 f"Звонки: {has('org.telegram.ui.Components.voip.VoIPHelper')}",
+                 f"Отправлено команд: {s['sent']}, ошибок отправки: {s['send_err']}",
+                 f"Получено команд: {s['recv']}" + (f", последняя {ago} с назад" if ago is not None else ""),
+                 f"Лобби: {self.session['role'] if self.session else 'нет'}",
+                 f"Сдвиг часов: {self.offset} мс" + (f", пинг {self.best_rtt} мс" if self.best_rtt else "")]
+        if self.errors:
+            lines += ["", "Ошибки:"] + self.errors[-10:]
+        text = "\n".join(lines)
+
+        def ui():
+            act = self.activity()
+            if act is None:
+                return
+            b = AlertDialogBuilder(act)
+            b.set_title("🛠 Проверка Wtogether")
+            b.set_message(text)
+            b.set_positive_button("Скопировать", lambda bb, w: (bb.dismiss(), copy_to_clipboard(text)))
+            b.set_negative_button("Закрыть", lambda bb, w: bb.dismiss())
+            b.show()
+        run_on_ui_thread(ui)
+
+    # ---------- отправка ----------
+
+    def human(self, c):
+        t = c.get("t")
+        if t == "st":
+            return ("▶️ " if c["p"] else "⏸ ") + fmt_time(c["pos"])
+        if t == "msg":
+            return "💬 " + c.get("x", "")
+        return {"go": "▶️ старт", "join": "подключаюсь", "ready": "готов(а)", "prog": "загружаю",
+                "ping": "связь", "pong": "связь", "roster": "участники", "ask": "синхронизация",
+                "leave": "вышел(ла)", "stop": "просмотр закончен", "decline": "отказ"}.get(t, t or "")
+
+    def send(self, cmd, to=None):
+        targets = [to] if to else self.peers()
         doc = cmd.get("d") or (self.session["doc"] if self.session else 0)
         for did in targets:
             c = dict(cmd)
@@ -1156,48 +1432,92 @@ class WtogetherPlugin(BasePlugin):
                 req.no_webpage = True
                 req.silent = True
                 send_request(req, self.after_sent)
+                self.stats["sent"] += 1
             except Exception as e:
-                self.err(f"send_cmd: {e}")
+                self.stats["send_err"] += 1
+                self.err(f"отправка: {e}")
 
-    def after_sent(self, resp, err):
-        if err is not None or resp is None:
-            self.err(f"служебное сообщение не ушло: {getattr(err, 'text', err)}")
+    def after_sent(self, resp, error):
+        if error is not None or resp is None:
+            self.stats["send_err"] += 1
+            self.err(f"команда не ушла: {getattr(error, 'text', error)}")
             return
-        mid = 0
         try:
             if hasattr(resp, "updates") and resp.updates is not None:
                 for i in range(resp.updates.size()):
                     u = resp.updates.get(i)
                     if u.getClass().getSimpleName() == "TL_updateMessageID":
-                        mid = int(u.id)
-                        break
-                    if getattr(u, "message", None) is not None and hasattr(u.message, "id"):
-                        mid = int(u.message.id)
+                        self.to_delete.append(int(u.id))
             elif hasattr(resp, "id"):
-                mid = int(resp.id)
+                self.to_delete.append(int(resp.id))
         except Exception as e:
             self.err(f"after_sent: {e}")
-        if mid:
-            threading.Timer(DELETE_AFTER, lambda: self.delete_remote(mid)).start()
 
-    def delete_remote(self, mid):
+    def flush_deletes(self):
+        if not self.running:
+            return
+        ids, self.to_delete = self.to_delete[:100], self.to_delete[100:]
+        if ids:
+            try:
+                req = TLRPC.TL_messages_deleteMessages()
+                req.revoke = True
+                for i in ids:
+                    req.id.add(Integer(i))
+                send_request(req, lambda r, e: e is not None and self.err(f"удаление: {getattr(e, 'text', e)}"))
+            except Exception as e:
+                self.err(f"удаление: {e}")
+        threading.Timer(DELETE_EVERY, self.flush_deletes).start()
+
+    def delete_local(self, did, mids):
+        """Удаляем полученные служебные сообщения у себя (и на сервере)."""
         try:
-            req = TLRPC.TL_messages_deleteMessages()
-            req.revoke = True
-            req.id.add(Integer(mid))
-            send_request(req, lambda r, e: None)
+            from java.util import ArrayList
+            from hook_utils import find_class
+            ids = ArrayList()
+            for m in mids:
+                ids.add(Integer(m))
+            mc = get_messages_controller()
+            cls = find_class("org.telegram.messenger.MessagesController")
+            for m in cls.getDeclaredMethods():
+                if str(m.getName()) != "deleteMessages":
+                    continue
+                types = [str(t.getName()) for t in m.getParameterTypes()]
+                if len(types) < 5 or types[0] != "java.util.ArrayList":
+                    continue
+                if "long" not in types or "boolean" not in types:
+                    continue
+                args, used_list, used_long = [], False, False
+                for t in types:
+                    if t == "java.util.ArrayList":
+                        args.append(None if used_list else ids)
+                        used_list = True
+                    elif t == "long":
+                        args.append(Long(0 if used_long else did))   # первый long — id чата
+                        used_long = True
+                    elif t == "boolean":
+                        args.append(Boolean(True))
+                    elif t == "int":
+                        args.append(Integer(0))
+                    else:
+                        args.append(None)
+                m.invoke(mc, *args)
+                return
         except Exception as e:
-            self.err(f"delete_remote: {e}")
+            self.err(f"удаление у себя: {e}")
 
-    # ---------- входящие ----------
+    # ---------- приём ----------
 
     def on_update_hook(self, update_name, account, update):
         try:
             msg = getattr(update, "message", None)
             if msg is None or msg.out or not has_cmd(msg.message):
                 return HookResult()
-            did = int(MessageObject.getDialogId(msg))
-            if self.handle_incoming(did, int(msg.id), msg.message):
+            reply = 0
+            try:
+                reply = int(msg.reply_to.reply_to_msg_id) if msg.reply_to is not None else 0
+            except Exception:
+                pass
+            if self.incoming(int(MessageObject.getDialogId(msg)), int(msg.id), msg.message, reply):
                 return HookResult(strategy=HookStrategy.CANCEL)
         except Exception as e:
             self.err(f"on_update_hook: {e}")
@@ -1207,128 +1527,167 @@ class WtogetherPlugin(BasePlugin):
         try:
             if container_name != "TL_updateShortMessage" or updates.out or not has_cmd(updates.message):
                 return HookResult()
-            if self.handle_incoming(int(updates.user_id), int(updates.id), updates.message):
+            reply = 0
+            try:
+                reply = int(updates.reply_to.reply_to_msg_id) if updates.reply_to is not None else 0
+            except Exception:
+                pass
+            if self.incoming(int(updates.user_id), int(updates.id), updates.message, reply):
                 return HookResult(strategy=HookStrategy.CANCEL)
         except Exception as e:
             self.err(f"on_updates_hook: {e}")
         return HookResult()
 
-    def bubble_or_notify(self, who, text):
-        if self.overlay is not None and self.overlay.mode == "lobby":
-            run_on_ui_thread(lambda: self.overlay and self.overlay.bubble(who, text))
-        else:
-            self.notify(f"{who}: {text}")
+    def on_new_messages(self, did, messages):
+        hide = []
+        for i in range(messages.size()):
+            mo = messages.get(i)
+            try:
+                if mo.isOut():
+                    continue
+                text = str(mo.messageOwner.message or "")
+                if not has_cmd(text):
+                    continue
+                reply = 0
+                try:
+                    reply = int(mo.getReplyMsgId())
+                except Exception:
+                    pass
+                if self.incoming(did, int(mo.getId()), text, reply):
+                    hide.append(int(mo.getId()))
+            except Exception as e:
+                self.err(f"new message: {e}")
+        if hide:
+            run_on_ui_thread(lambda: self.delete_local(did, hide))
 
-    def on_invite(self, did, doc):
-        name = self.friend_name(did)
-
-        def join():
-            if self.session:
-                self.stop_session()
-            self.session = {"role": "guest", "doc": doc, "host": did, "accepted": True,
-                            "roster": [], "since": now_ms()}
-            self.remote = None
-            self.talk = []
-            self.send_cmd({"t": "accept"})
-            BulletinHelper.show_success(f"Открой видео в чате — над приглашением. Ведёт {name} 👑")
-
-        def decline():
-            self.send_cmd({"t": "decline", "d": doc}, to=did)
-
-        if self.session and not (self.is_guest() and self.session["host"] == did and self.session["doc"] == doc):
-            self.dialog(f"🎬 {name} зовёт смотреть",
-                        "Ты уже в другом совместном просмотре. Перейти к " + name + "?",
-                        positive=("Перейти", join), negative=("Отказаться", decline),
-                        neutral=("Позже", None), red_negative=True)
-            return
-        if not self.get_setting("ask_invite", True):
-            join()
-            return
-        self.dialog(f"🎬 {name} зовёт смотреть вместе",
-                    f"{name} будет ведущим 👑: пауза и перемотка у всех как у него. "
-                    "Поверх видео будут аватарки участников, сообщения и звонок.\n\n"
-                    "Видео — в сообщении, на которое ответил друг.",
-                    positive=("Смотреть", join), negative=("Отказаться", decline),
-                    neutral=("Позже", None), red_negative=True)
-
-    def handle_incoming(self, did, mid, text):
-        """Разбирает команду. True — скрыть сообщение из чата."""
+    def incoming(self, did, mid, text, reply=0):
+        """Разбирает команду в любом потоке, обрабатывает в главном. True — скрыть."""
         key = (did, mid)
-        if key in self.seen:
-            return True
-        self.seen.add(key)
-        if len(self.seen) > 500:
-            self.seen.clear()
         cmd = extract_cmd(text)
         if not cmd:
             return False
-        t = cmd.get("t")
-        doc = int(cmd.get("d") or 0)
-        name = self.friend_name(did)
+        hide = cmd.get("t") != "invite"
+        if key in self.seen:
+            return hide
+        self.seen.add(key)
+        if len(self.seen) > 1000:
+            self.seen.clear()
+        self.stats["recv"] += 1
+        self.stats["last_recv"] = now_ms()
+        run_on_ui_thread(lambda: self.safe(lambda: self.process(did, cmd, reply)))
+        return hide
+
+    def process(self, did, c, reply):
+        t = c.get("t")
+        doc = int(c.get("d") or 0)
+        name = self.name(did)
 
         if t == "invite":
-            self.on_invite(did, doc)
-            return False  # приглашение остаётся видимым
+            self.invites[(did, doc)] = reply
+            self.on_invite(did, doc, reply)
+            return
 
-        # --- я ведущий, пишет зритель ---
+        # --- я ведущий ---
         if self.is_host() and did in self.session["guests"] and doc == self.session["doc"]:
             g = self.session["guests"][did]
-            if t == "accept":
-                g["accepted"] = True
-                self.notify(f"✅ {name} в лобби")
+            g["seen"] = now_ms()
+            if t == "join":
+                g["stage"] = "joined"
+                self.notify(f"✅ {name} подключается")
                 self.send_roster()
-            elif t == "decline":
-                self.session["guests"].pop(did, None)
-                self.notify(f"🙅 {name} отказался(ась)")
+            elif t == "prog":
+                g["stage"] = "loading"
+                g["pc"] = int(c.get("pc") or 0)
+            elif t == "ready":
+                g["stage"] = "ready"
+                self.notify(f"🟢 {name} готов(а)")
                 self.send_roster()
-            elif t == "leave":
-                self.session["guests"].pop(did, None)
-                self.notify(f"👋 {name} вышел(ла) из лобби")
-                self.send_roster()
+                if self.session["started"]:
+                    self.broadcast_state(to=did)
             elif t == "ask":
-                first = not g.get("open")
-                g["accepted"] = True
-                g["open"] = True
-                if first:
-                    self.notify(f"🟢 {name} смотрит с тобой")
-                    self.send_roster()
-                run_on_ui_thread(lambda: self.send_state(force=True, to=did))
+                self.broadcast_state(to=did)
+            elif t == "ping":
+                self.send({"t": "pong", "a": c.get("a"), "b": now_ms()}, to=did)
+            elif t in ("leave", "decline"):
+                self.session["guests"].pop(did, None)
+                self.notify(f"👋 {name} " + ("вышел(ла)" if t == "leave" else "отказался(ась)"))
+                self.send_roster()
             elif t == "msg":
-                text_ = str(cmd.get("x") or "")[:300]
-                at = int(cmd.get("at") or 0)
-                self.talk.append((at, name, text_))
-                self.bubble_or_notify(name, text_)
-                # пересылаем остальным зрителям
-                for other in self.peer_dids():
+                x = str(c.get("x") or "")[:300]
+                at = int(c.get("at") or 0)
+                self.talk.append((at, name, x))
+                if self.player is not None:
+                    self.player.bubble(name, x)
+                for other in self.peers():
                     if other != did:
-                        self.send_cmd({"t": "msg", "x": text_, "at": at, "n": name, "u": did}, to=other)
-            elif t == "voice":
-                self.notify(f"📞 {name} звонит")
-            return True
+                        self.send({"t": "msg", "x": x, "at": at, "n": name, "u": did}, to=other)
+            self.update_ui()
+            return
 
-        # --- я зритель, пишет ведущий ---
+        # --- я зритель ---
         if self.is_guest() and did == self.session["host"]:
-            if t == "stop":
-                self.clear_session()
-                self.notify(f"⏹ {name} закончил(а) просмотр")
-            elif t == "roster":
-                self.session["roster"] = cmd.get("m") or []
-            elif t == "msg":
-                who = cmd.get("n") or name
-                text_ = str(cmd.get("x") or "")[:300]
-                self.talk.append((int(cmd.get("at") or 0), who, text_))
-                self.bubble_or_notify(who, text_)
-            elif t == "voice":
-                self.notify(f"📞 {name} звонит")
+            self.last_host_msg = now_ms()
+            if t == "pong":
+                a, b = int(c.get("a") or 0), int(c.get("b") or 0)
+                rtt = now_ms() - a
+                if a and b and rtt >= 0:
+                    # берём замер с самой короткой задержкой из последних — он точнее всего
+                    self.rtts = (self.rtts + [(rtt, b + rtt // 2 - now_ms())])[-6:]
+                    self.best_rtt, self.offset = min(self.rtts)
+            elif t == "go" and doc == self.session["doc"]:
+                self.go = {"pos": int(c.get("pos") or 0), "at": int(c.get("at") or 0), "r": float(c.get("r") or 1.0)}
+                self.remote = None
             elif t == "st" and doc == self.session["doc"]:
+                self.go = None
                 prev = self.remote
-                self.remote = {"p": bool(cmd.get("p")), "pos": int(cmd.get("pos") or 0),
-                               "r": float(cmd.get("r") or 1.0), "ts": int(cmd.get("ts") or now_ms())}
-                self.remote_at = now_ms()
-                if prev is not None and prev["p"] != self.remote["p"]:
-                    self.bubble_or_notify("👑 " + name, self.human(cmd))
-                run_on_ui_thread(self.apply_remote)
-            return True
+                self.remote = {"p": bool(c.get("p")), "pos": int(c.get("pos") or 0),
+                               "r": float(c.get("r") or 1.0), "ts": int(c.get("ts") or self.room_now())}
+                if prev is not None and prev["p"] != self.remote["p"] and self.player is not None:
+                    self.player.bubble("👑 " + name, self.human(c))
+            elif t == "roster":
+                self.session["roster"] = c.get("m") or []
+            elif t == "msg":
+                who = c.get("n") or name
+                x = str(c.get("x") or "")[:300]
+                self.talk.append((int(c.get("at") or 0), who, x))
+                if self.player is not None:
+                    self.player.bubble(who, x)
+                else:
+                    self.notify(f"💬 {who}: {x}")
+            elif t == "stop":
+                self.notify(f"⏹ {name} закончил(а) просмотр")
+                self.session = None
+                self.remote = None
+                if self.player is not None:
+                    self.player.close()
+                return
+            self.update_ui()
 
-        # служебная команда не к текущему лобби — просто прячем
-        return True
+    def on_invite(self, host, doc, reply):
+        name = self.name(host)
+
+        def accept():
+            self.join_from_invite(host, doc, reply)
+
+        def decline():
+            self.send({"t": "decline", "d": doc}, to=host)
+
+        if not self.get_setting("ask_invite", True) and not self.session:
+            accept()
+            return
+        act = self.activity()
+        if act is None:
+            BulletinHelper.show_info(f"🎬 {name} зовёт смотреть вместе")
+            return
+        b = AlertDialogBuilder(act)
+        b.set_title(f"🎬 {name} зовёт смотреть вместе")
+        b.set_message(f"{name} — ведущий 👑: он ставит паузу и перематывает, у тебя всё повторяется само.\n\n"
+                      "Откроется общий плеер, видео загрузится, и вы начнёте одновременно.")
+        b.set_positive_button("Смотреть", lambda bb, w: (bb.dismiss(), self.safe(accept)))
+        b.set_negative_button("Отказаться", lambda bb, w: (bb.dismiss(), self.safe(decline)))
+        b.set_neutral_button("Позже", lambda bb, w: bb.dismiss())
+        b.show()
+        try:
+            b.make_button_red(AlertDialogBuilder.BUTTON_NEGATIVE)
+        except Exception:
+            pass

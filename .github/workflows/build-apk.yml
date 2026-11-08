@@ -3,6 +3,7 @@ name: Собрать APK
 on:
   push:
     branches: [main, wtogether]
+    paths-ignore: ['plugin/**']
   workflow_dispatch:
 
 permissions:

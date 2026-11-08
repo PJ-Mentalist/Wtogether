@@ -1,0 +1,445 @@
+"""
+Wtogether для exteraGram: совместный просмотр видео из личного чата.
+
+Как работает:
+1. Долгое нажатие на видео в личке → «Смотреть вместе». Другу уходит приглашение.
+2. Оба открываете это видео. Пауза, перемотка и скорость становятся общими.
+3. Команды идут тихими служебными сообщениями: у друга они скрываются,
+   а у отправителя удаляются с сервера через несколько секунд.
+Плагин должен стоять у обоих.
+"""
+import json
+import random
+import re
+import threading
+import time
+
+from base_plugin import BasePlugin, HookResult, HookStrategy, MenuItemData, MenuItemType, MethodHook
+from hook_utils import find_class, get_private_field
+from client_utils import send_request, send_text, get_messages_controller
+from android_utils import run_on_ui_thread
+from ui.bulletin import BulletinHelper
+from ui.settings import Header, Switch, Text
+from java.lang import Integer, Long
+from org.telegram.tgnet import TLRPC
+from org.telegram.messenger import MessageObject
+
+__id__ = "wtogether"
+__name__ = "Wtogether"
+__description__ = "Смотрите видео из личного чата вместе: пауза, перемотка и скорость общие у обоих"
+__author__ = "Wtogether"
+__version__ = "1.0.0"
+__icon__ = "exteraPlugins/1"
+__category__ = ["media", "chats"]
+
+TAG = "#wt1 "
+TAG_RE = re.compile(r"#wt1 (\{.*\})", re.S)
+SEND_DELAY = 0.45      # с: склеиваем частые события (перетаскивание ползунка) в одну команду
+QUIET = 1.5            # с: после применения команды друга не отправляем «эхо»
+DRIFT_MS = 700         # расхождение, после которого перематываем
+DELETE_AFTER = 3.0     # с: через сколько удалять свою служебную команду с сервера
+
+
+def now_ms():
+    return int(time.time() * 1000)
+
+
+def fmt_time(ms):
+    s = max(0, int(ms) // 1000)
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+class PlayerHook(MethodHook):
+    def __init__(self, plugin, name):
+        self.plugin = plugin
+        self.name = name
+
+    def after_hooked_method(self, param):
+        try:
+            self.plugin.on_player_event(param.thisObject, self.name)
+        except Exception as e:
+            self.plugin.logger.error(f"player hook {self.name}: {e}")
+
+
+class WtogetherPlugin(BasePlugin):
+
+    # ---------- жизненный цикл ----------
+
+    def on_plugin_load(self):
+        self.session = None      # {"dialog": id чата, "doc": id видеофайла}
+        self.remote = None       # последнее состояние от друга
+        self.bound = None        # плеер, который сейчас синхронизируем
+        self.quiet_until = 0.0
+        self.seq = 0
+        self.seen = set()
+        self.pv_class = find_class("org.telegram.ui.PhotoViewer")
+
+        self.add_hook("TL_updateNewMessage")
+        self.add_hook("TL_updateShortMessage")
+
+        self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
+            text="Смотреть вместе",
+            on_click=self.on_watch_click,
+        ))
+        self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.CHAT_ACTION_MENU,
+            text="Wtogether: подтянуть друга ко мне",
+            on_click=self.on_resync_click,
+        ))
+        self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.CHAT_ACTION_MENU,
+            text="Wtogether: закончить просмотр",
+            on_click=self.on_stop_click,
+        ))
+
+        player_cls = find_class("org.telegram.ui.Components.VideoPlayer")
+        if not player_cls:
+            self.logger.error("VideoPlayer не найден: синхронизация не будет работать")
+            return
+        hooked = 0
+        for name in ("play", "pause", "seekTo", "setPlaybackSpeed"):
+            hooked += len(self.hook_all_methods(player_cls, name, PlayerHook(self, name)) or [])
+        self.logger.info(f"Wtogether загружен, хуков плеера: {hooked}")
+
+    def create_settings(self):
+        return [
+            Header(text="Wtogether"),
+            Switch(key="notify", text="Показывать действия друга", default=True,
+                   subtext="Короткие уведомления: пауза, перемотка, подключение"),
+            Text(text="Как пользоваться",
+                 subtext="Долгое нажатие на видео в личке → «Смотреть вместе». "
+                         "Потом оба открывайте это видео. Плагин нужен у обоих."),
+        ]
+
+    # ---------- меню ----------
+
+    def on_watch_click(self, context):
+        msg = context.get("message")
+        if msg is None or not msg.isVideo():
+            BulletinHelper.show_error("Выбери сообщение с видео")
+            return
+        did = int(msg.getDialogId())
+        if did <= 0:
+            BulletinHelper.show_error("Пока работает только в личных чатах")
+            return
+        doc = self.doc_of(msg)
+        if not doc:
+            BulletinHelper.show_error("Не удалось распознать видео")
+            return
+        self.start_session(did, doc)
+        payload = json.dumps({"t": "invite", "d": doc}, separators=(",", ":"))
+        text = ("🎬 Давай посмотрим это видео вместе! Открой его — пауза и перемотка будут общими.\n"
+                "Нужен плагин Wtogether для exteraGram.\n" + TAG + payload)
+        try:
+            send_text(did, text, replyToMsg=msg)
+        except Exception:
+            send_text(did, text)
+        BulletinHelper.show_success("Приглашение отправлено. Открывай видео")
+
+    def on_resync_click(self, context):
+        if not self.session or self.bound is None:
+            BulletinHelper.show_error("Сначала начни совместный просмотр и открой видео")
+            return
+        run_on_ui_thread(lambda: self.send_state(force=True))
+        BulletinHelper.show_info("Отправил другу твою позицию")
+
+    def on_stop_click(self, context):
+        if not self.session:
+            BulletinHelper.show_info("Совместный просмотр не идёт")
+            return
+        self.send_cmd({"t": "stop"})
+        self.session = None
+        self.bound = None
+        self.remote = None
+        BulletinHelper.show_info("Совместный просмотр закончен")
+
+    # ---------- плеер ----------
+
+    def start_session(self, did, doc):
+        self.session = {"dialog": did, "doc": doc}
+        self.remote = None
+        self.bound = None
+
+    def doc_of(self, msg):
+        try:
+            doc = msg.getDocument()
+            return int(doc.id) if doc is not None else 0
+        except Exception:
+            return 0
+
+    def viewer(self):
+        """Открытый просмотрщик Telegram, его плеер и текущее сообщение."""
+        try:
+            PhotoViewer = self.pv_class
+            if PhotoViewer is None:
+                return None, None, None
+            try:
+                has = PhotoViewer.getDeclaredMethod("hasInstance").invoke(None)
+                if not has:
+                    return None, None, None
+            except Exception:
+                pass
+            pv = PhotoViewer.getDeclaredMethod("getInstance").invoke(None)
+            if pv is None:
+                return None, None, None
+            return pv, get_private_field(pv, "videoPlayer"), get_private_field(pv, "currentMessageObject")
+        except Exception as e:
+            self.logger.error(f"viewer: {e}")
+            return None, None, None
+
+    def session_player(self):
+        """Плеер, если сейчас открыто именно видео совместного просмотра."""
+        if not self.session:
+            return None, None
+        pv, player, msg = self.viewer()
+        if player is None or msg is None:
+            return None, None
+        if int(msg.getDialogId()) != self.session["dialog"] or self.doc_of(msg) != self.session["doc"]:
+            return None, None
+        return pv, player
+
+    def on_player_event(self, player, name):
+        if not self.session:
+            return
+        pv, sp = self.session_player()
+        if sp is None or not sp.equals(player):
+            return
+        if self.bound is None or not self.bound.equals(player):
+            # видео только что открыли
+            self.bound = player
+            self.on_video_opened()
+            return
+        if time.time() < self.quiet_until:
+            return
+        self.seq += 1
+        s = self.seq
+        threading.Timer(SEND_DELAY, lambda: run_on_ui_thread(lambda: self.send_state(seq=s))).start()
+
+    def on_video_opened(self):
+        self.quiet_until = time.time() + QUIET
+        if self.remote:
+            run_on_ui_thread(self.apply_remote, 800)
+        else:
+            self.send_cmd({"t": "ask"})
+
+    def read_state(self):
+        player = self.bound
+        if player is None:
+            return None
+        try:
+            playing = bool(player.isPlaying())
+            pos = int(player.getCurrentPosition())
+        except Exception as e:
+            self.logger.error(f"read_state: {e}")
+            return None
+        try:
+            rate = float(player.getPlaybackSpeed())
+        except Exception:
+            rate = 1.0
+        return {"p": playing, "pos": pos, "r": rate, "ts": now_ms()}
+
+    def send_state(self, seq=None, force=False):
+        if seq is not None and seq != self.seq:
+            return
+        if not force and time.time() < self.quiet_until:
+            return
+        pv, sp = self.session_player()
+        if sp is None or self.bound is None or not sp.equals(self.bound):
+            return
+        st = self.read_state()
+        if st:
+            st["t"] = "st"
+            self.send_cmd(st)
+
+    def apply_remote(self):
+        st = self.remote
+        pv, player = self.session_player()
+        if not st or player is None:
+            return
+        self.bound = player
+        self.quiet_until = time.time() + QUIET
+        elapsed = min(max(0, now_ms() - st["ts"]), 60000)
+        target = st["pos"] + (elapsed * st["r"] if st["p"] else 0)
+        try:
+            try:
+                if abs(float(player.getPlaybackSpeed()) - st["r"]) > 0.01:
+                    player.setPlaybackSpeed(float(st["r"]))
+            except Exception:
+                pass
+            if abs(int(player.getCurrentPosition()) - target) > DRIFT_MS:
+                player.seekTo(int(target))
+            if bool(player.isPlaying()) != st["p"]:
+                self.toggle(pv, player, st["p"])
+        except Exception as e:
+            self.logger.error(f"apply_remote: {e}")
+
+    def toggle(self, pv, player, want_play):
+        # через просмотрщик, чтобы кнопка ▶/⏸ на экране тоже переключилась
+        try:
+            m = self.pv_class.getDeclaredMethod("toggleVideoPlayer")
+            m.setAccessible(True)
+            m.invoke(pv)
+            return
+        except Exception as e:
+            self.logger.info(f"toggleVideoPlayer недоступен: {e}")
+        if want_play:
+            player.play()
+        else:
+            player.pause()
+
+    # ---------- служебные сообщения ----------
+
+    def human(self, cmd):
+        t = cmd.get("t")
+        if t == "st":
+            return ("▶️ смотрим с " if cmd["p"] else "⏸ пауза на ") + fmt_time(cmd["pos"])
+        if t == "ask":
+            return "🔄 подключаюсь"
+        if t == "stop":
+            return "⏹ просмотр закончен"
+        return t or ""
+
+    def send_cmd(self, cmd):
+        sess = self.session
+        if not sess:
+            return
+        cmd["d"] = sess["doc"]
+        text = "🎬 Wtogether: " + self.human(cmd) + "\n" + TAG + json.dumps(cmd, separators=(",", ":"))
+        try:
+            req = TLRPC.TL_messages_sendMessage()
+            req.peer = get_messages_controller().getInputPeer(Long(sess["dialog"]))
+            req.message = text
+            req.random_id = random.getrandbits(62)
+            req.no_webpage = True
+            req.silent = True
+            send_request(req, self.after_sent)
+        except Exception as e:
+            self.logger.error(f"send_cmd: {e}")
+
+    def after_sent(self, resp, err):
+        if err is not None or resp is None:
+            self.logger.error(f"служебное сообщение не ушло: {getattr(err, 'text', err)}")
+            return
+        mid = 0
+        try:
+            if hasattr(resp, "updates") and resp.updates is not None:
+                for i in range(resp.updates.size()):
+                    u = resp.updates.get(i)
+                    if u.getClass().getSimpleName() == "TL_updateMessageID":
+                        mid = int(u.id)
+                        break
+                    if getattr(u, "message", None) is not None and hasattr(u.message, "id"):
+                        mid = int(u.message.id)
+            elif hasattr(resp, "id"):
+                mid = int(resp.id)
+        except Exception as e:
+            self.logger.error(f"after_sent: {e}")
+        if mid:
+            threading.Timer(DELETE_AFTER, lambda: self.delete_remote(mid)).start()
+
+    def delete_remote(self, mid):
+        try:
+            req = TLRPC.TL_messages_deleteMessages()
+            req.revoke = True
+            req.id.add(Integer(mid))
+            send_request(req, lambda r, e: None)
+        except Exception as e:
+            self.logger.error(f"delete_remote: {e}")
+
+    # ---------- входящие ----------
+
+    def on_update_hook(self, update_name, account, update):
+        try:
+            msg = getattr(update, "message", None)
+            if msg is None or msg.out:
+                return HookResult()
+            text = msg.message or ""
+            if TAG not in text:
+                return HookResult()
+            did = int(MessageObject.getDialogId(msg))
+            if self.handle_incoming(did, int(msg.id), text):
+                return HookResult(strategy=HookStrategy.CANCEL)
+        except Exception as e:
+            self.logger.error(f"on_update_hook: {e}")
+        return HookResult()
+
+    def on_updates_hook(self, container_name, account, updates):
+        try:
+            if container_name != "TL_updateShortMessage" or updates.out:
+                return HookResult()
+            text = updates.message or ""
+            if TAG not in text:
+                return HookResult()
+            if self.handle_incoming(int(updates.user_id), int(updates.id), text):
+                return HookResult(strategy=HookStrategy.CANCEL)
+        except Exception as e:
+            self.logger.error(f"on_updates_hook: {e}")
+        return HookResult()
+
+    def friend_name(self, did):
+        try:
+            u = get_messages_controller().getUser(Long(did))
+            if u is not None and u.first_name:
+                return u.first_name
+        except Exception:
+            pass
+        return "Друг"
+
+    def notify(self, text):
+        if self.get_setting("notify", True):
+            BulletinHelper.show_info(text)
+
+    def handle_incoming(self, did, mid, text):
+        """Разбирает команду друга. True — скрыть сообщение из чата."""
+        key = (did, mid)
+        if key in self.seen:
+            return True
+        self.seen.add(key)
+        if len(self.seen) > 500:
+            self.seen.clear()
+        m = TAG_RE.search(text)
+        if not m:
+            return False
+        try:
+            cmd = json.loads(m.group(1))
+        except Exception:
+            return False
+        t = cmd.get("t")
+        doc = int(cmd.get("d") or 0)
+        name = self.friend_name(did)
+
+        if t == "invite":
+            self.start_session(did, doc)
+            self.notify(f"🎬 {name} зовёт смотреть видео вместе. Открой его в чате")
+            return False  # приглашение остаётся видимым
+
+        if t == "stop":
+            if self.session and self.session["dialog"] == did:
+                self.session = None
+                self.bound = None
+                self.remote = None
+                self.notify(f"{name} закончил(а) совместный просмотр")
+            return True
+
+        # команда к другому видео или после перезапуска: подхватываем сессию
+        if not self.session or self.session["dialog"] != did or self.session["doc"] != doc:
+            self.start_session(did, doc)
+
+        if t == "ask":
+            self.notify(f"{name} открыл(а) видео")
+            run_on_ui_thread(lambda: self.send_state(force=True))
+            return True
+
+        if t == "st":
+            prev = self.remote
+            self.remote = {"p": bool(cmd.get("p")), "pos": int(cmd.get("pos") or 0),
+                           "r": float(cmd.get("r") or 1.0), "ts": int(cmd.get("ts") or now_ms())}
+            if prev is None or prev["p"] != self.remote["p"]:
+                self.notify(f"{name}: " + self.human(cmd))
+            run_on_ui_thread(self.apply_remote)
+            return True
+
+        return True
